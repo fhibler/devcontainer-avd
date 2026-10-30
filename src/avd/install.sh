@@ -191,13 +191,27 @@ if [ "$family" = rhel ]; then
     if rpm -q --quiet curl; then rhel_curl=curl; fi
     if rpm -q --quiet coreutils-single; then rhel_coreutils=coreutils-single; fi
 fi
+install_dnf_packages() {
+    local attempt
+    for attempt in 1 2; do
+        if dnf --setopt=retries=3 --setopt=timeout=30 install -y "$@"; then
+            return 0
+        fi
+        if [ "$attempt" -eq 1 ]; then
+            printf '%s\n' 'AVD: DNF package install failed; refreshing metadata and retrying once.' >&2
+            dnf clean metadata || true
+            sleep 2
+        fi
+    done
+    return 1
+}
 if [ "$family" = debian ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends ca-certificates curl git make tar gzip unzip coreutils findutils openssh-client "${source_packages[@]}"
     rm -rf /var/lib/apt/lists/*
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"
+    install_dnf_packages ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"
     dnf clean all
 elif command -v microdnf >/dev/null 2>&1; then
     microdnf install -y ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"

@@ -53,18 +53,22 @@ The vendored Feature schema comes from the
 
 The [test workflow](../.github/workflows/test.yml) runs on every push, pull
 request, weekly schedule, manual request, and reusable call. It validates and
-packages once, then runs a separate visible job for each OS image/native
-architecture pair in the [platform matrix](platforms.md). Each job has its own
-status, logs, and artifacts; installation and smoke phases run inside its
-`Test native platform` step.
+packages once, then tests each platform image on both native architectures.
+Known image-tag aliases share a job so BuildKit can reuse the install layer
+when tags resolve to the same digest. Every tag is still resolved and smoke
+checked. A platform build is capped at 20 minutes per image, and DNF refreshes
+metadata and retries once after an install failure. Job names show the
+architecture and image tags, and each group retains logs and artifacts.
 
 Additional integration jobs cover modes, optional dependencies, Python
 selections, users/UID adjustment, official Feature composition, duplicate
 installation, source lifecycle, and runnable examples on both architectures.
+Scenarios using the same image run in pairs on one runner so they can reuse its
+Docker image cache; failures remain reported per scenario.
 The pinned AVD 6.4.0 regression fixture runs alongside current-release and
 source-`devel` coverage; preparation resolves moving source refs to commits.
-Downloads and installations are cold; previous environments are not reused as
-proof of installation.
+Workflow runs start on fresh runners; cache reuse is limited to repeated images
+within the same test job.
 
 `Required tests` is the stable branch-protection check. All required results,
 including unexpectedly skipped or cancelled jobs, must pass. Normal CI has

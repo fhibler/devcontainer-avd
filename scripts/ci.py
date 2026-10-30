@@ -14,12 +14,28 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import traceback
 import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / "artifacts"
 ENGINE = os.environ.get("CONTAINER_ENGINE", "docker")
+MAX_SCENARIOS_PER_GROUP = 2
+PLATFORM_BUILD_TIMEOUT_SECONDS = 20 * 60
+ACTIVE_TEST_ARTIFACTS = None
+IMAGE_IDENTITIES = {}
+# Co-locate tags that commonly resolve to the same image so BuildKit can reuse
+# the completed feature-install layer. If a pair's digests diverge, both still run.
+PLATFORM_IMAGE_ALIAS_GROUPS = [
+    ("debian-13", ("debian:13", "debian:latest")),
+    ("debian-13-slim", ("debian:13-slim", "debian:stable-slim")),
+    ("ubuntu-26.04", ("ubuntu:26.04", "ubuntu:latest")),
+    ("ubuntu-26.10", ("ubuntu:26.10", "ubuntu:rolling")),
+    ("almalinux-9", ("almalinux:9", "almalinux:9.8")),
+    ("almalinux-10", ("almalinux:10", "almalinux:10.2")),
+    ("rockylinux-10", ("quay.io/rockylinux/rockylinux:10", "quay.io/rockylinux/rockylinux:10.2")),
+]
 spec = importlib.util.spec_from_file_location("avd_setup", ROOT / "src/avd/avd_setup.py")
 setup = importlib.util.module_from_spec(spec)
 sys.dont_write_bytecode = True
@@ -32,8 +48,9 @@ def run(*args, **kwargs):
     output = result.stdout.strip()
     if result.returncode:
         output = setup.redact(output)
-        ARTIFACTS.mkdir(exist_ok=True)
-        (ARTIFACTS / "failure.log").write_text(output + "\n")
+        failure_dir = ACTIVE_TEST_ARTIFACTS or ARTIFACTS
+        failure_dir.mkdir(parents=True, exist_ok=True)
+        (failure_dir / "failure.log").write_text(output + "\n")
         print(output, flush=True)
         raise subprocess.CalledProcessError(result.returncode, args, output=output)
     return output
@@ -66,6 +83,47 @@ def extract(archive, destination):
         assert (destination / file).is_file(), f"Missing packaged payload: {file}"
 
 
+def group_scenarios(scenarios):
+    by_image = {}
+    for scenario in scenarios:
+        by_image.setdefault(scenario["image"], []).append(scenario["name"])
+    groups = []
+    for image, names in by_image.items():
+        for offset in range(0, len(names), MAX_SCENARIOS_PER_GROUP):
+            group_names = names[offset : offset + MAX_SCENARIOS_PER_GROUP]
+            groups.append(
+                {
+                    "id": group_names[0],
+                    "image": image,
+                    "scenarios": json.dumps(group_names, separators=(",", ":")),
+                }
+            )
+    return groups
+
+
+def group_platform_images(images):
+    remaining = set(images)
+    groups = []
+    for group_id, aliases in PLATFORM_IMAGE_ALIAS_GROUPS:
+        group_images = [image for image in aliases if image in remaining]
+        if len(group_images) > 1:
+            groups.append(
+                {"id": group_id, "images": json.dumps(group_images, separators=(",", ":"))}
+            )
+            remaining.difference_update(group_images)
+    for image in images:
+        if image in remaining:
+            groups.append(
+                {
+                    "id": image.replace("/", "-").replace(":", "-"),
+                    "images": json.dumps([image], separators=(",", ":")),
+                }
+            )
+            remaining.remove(image)
+    assert not remaining, f"Unassigned platform images: {sorted(remaining)}"
+    return groups
+
+
 def prepare():
     ARTIFACTS.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="avd-package-") as directory:
@@ -93,15 +151,17 @@ def prepare():
         },
     )
     if os.environ.get("GITHUB_OUTPUT"):
+        images = json.loads((ROOT / "test/images.json").read_text())
+        scenarios = json.loads((ROOT / "test/scenarios.json").read_text())
         with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
             handle.write(
-                "images="
-                + json.dumps(json.loads((ROOT / "test/images.json").read_text()), separators=(",", ":"))
+                "platform_groups="
+                + json.dumps(group_platform_images(images), separators=(",", ":"))
                 + "\n"
             )
             handle.write(
-                "scenarios="
-                + json.dumps(json.loads((ROOT / "test/scenarios.json").read_text()), separators=(",", ":"))
+                "scenario_groups="
+                + json.dumps(group_scenarios(scenarios), separators=(",", ":"))
                 + "\n"
             )
             handle.write(f"version={feature['version']}\ncommit={run('git', 'rev-parse', 'HEAD')}\n")
@@ -118,8 +178,10 @@ def native_arch():
 
 
 def identity(image, log):
-    run(ENGINE, "pull", image)
-    details = json.loads(run(ENGINE, "image", "inspect", image))[0]
+    if image not in IMAGE_IDENTITIES:
+        run(ENGINE, "pull", image)
+        IMAGE_IDENTITIES[image] = json.loads(run(ENGINE, "image", "inspect", image))[0]
+    details = IMAGE_IDENTITIES[image]
     write(log / "image.json", {key: details.get(key) for key in ("Id", "RepoDigests", "Architecture", "Os")})
     assert details["Architecture"] == native_arch()
     return details["RepoDigests"][0]
@@ -185,7 +247,11 @@ def platform_smoke(image):
         tag = "avd-platform-" + uuid.uuid4().hex
         container = "avd-platform-" + uuid.uuid4().hex
         try:
-            subprocess.run([ENGINE, "build", "-t", tag, "-f", str(dockerfile), str(directory)], check=True)
+            subprocess.run(
+                [ENGINE, "build", "-t", tag, "-f", str(dockerfile), str(directory)],
+                check=True,
+                timeout=PLATFORM_BUILD_TIMEOUT_SECONDS,
+            )
             run(ENGINE, "create", "--name", container, tag, "sleep", "infinity")
             run(ENGINE, "start", container)
             (log / "manifest.json").write_text(run(ENGINE, "exec", container, "avd-info", "--json"))
@@ -198,6 +264,23 @@ def platform_smoke(image):
         finally:
             subprocess.run([ENGINE, "rm", "-f", container], check=False)
             subprocess.run([ENGINE, "rmi", tag], check=False)
+
+
+def platform_group(images):
+    global ACTIVE_TEST_ARTIFACTS
+    failures = []
+    for image in images:
+        ACTIVE_TEST_ARTIFACTS = ARTIFACTS / ("platform-" + image.replace("/", "_").replace(":", "_"))
+        ACTIVE_TEST_ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        try:
+            platform_smoke(image)
+        except Exception:
+            traceback.print_exc()
+            failures.append(image)
+        finally:
+            ACTIVE_TEST_ARTIFACTS = None
+    if failures:
+        raise RuntimeError(f"Platform image(s) failed: {', '.join(failures)}")
 
 
 def exec_container(workspace, *command):
@@ -368,20 +451,46 @@ def lifecycle(scenario):
         shutil.rmtree(workspace)
 
 
+def lifecycle_group(names):
+    global ACTIVE_TEST_ARTIFACTS
+    scenarios = {row["name"]: row for row in json.loads((ROOT / "test/scenarios.json").read_text())}
+    unknown = [name for name in names if name not in scenarios]
+    if unknown:
+        raise ValueError(f"Unknown integration scenario(s): {', '.join(unknown)}")
+
+    failures = []
+    for name in names:
+        ACTIVE_TEST_ARTIFACTS = ARTIFACTS / name
+        ACTIVE_TEST_ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        try:
+            lifecycle(scenarios[name])
+        except Exception:
+            traceback.print_exc()
+            failures.append(name)
+        finally:
+            ACTIVE_TEST_ARTIFACTS = None
+    if failures:
+        raise RuntimeError(f"Integration scenario(s) failed: {', '.join(failures)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "platform", "scenario"))
+    parser.add_argument("command", choices=("prepare", "platform", "platform-group", "scenario", "scenario-group"))
     parser.add_argument("value", nargs="?")
     args = parser.parse_args()
     if args.command == "prepare":
         prepare()
     elif args.command == "platform":
         platform_smoke(args.value)
-    else:
+    elif args.command == "platform-group":
+        platform_group(json.loads(args.value))
+    elif args.command == "scenario":
         scenario = next(
             row for row in json.loads((ROOT / "test/scenarios.json").read_text()) if row["name"] == args.value
         )
         lifecycle(scenario)
+    else:
+        lifecycle_group(json.loads(args.value))
 
 
 if __name__ == "__main__":
