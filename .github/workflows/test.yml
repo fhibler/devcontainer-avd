@@ -60,7 +60,7 @@ jobs:
       - run: npm install --global "@devcontainers/cli@$DEVCONTAINER_CLI"
       - id: prepare
         run: python3 scripts/ci.py prepare
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: tested-feature
           path: artifacts/
@@ -79,7 +79,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: tested-feature
           path: artifacts
@@ -93,7 +93,7 @@ jobs:
       - name: Collect diagnostics
         if: always()
         run: docker ps -a > artifacts/containers.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         if: always()
         with:
           name: platform-${{ matrix.runner }}-${{ strategy.job-index }}
@@ -118,7 +118,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_MAJOR }}
       - run: npm install --global "@devcontainers/cli@$DEVCONTAINER_CLI"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: tested-feature
           path: artifacts
@@ -129,7 +129,7 @@ jobs:
         env:
           SCENARIO: ${{ matrix.scenario.name }}
         run: python3 scripts/ci.py scenario "$SCENARIO"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         if: always()
         with:
           name: integration-${{ matrix.runner }}-${{ matrix.scenario.name }}
