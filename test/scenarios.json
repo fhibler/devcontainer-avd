@@ -1,0 +1,132 @@
+[
+  {
+    "name": "tools-debian",
+    "image": "debian:13",
+    "options": {
+      "mode": "tools",
+      "pythonVersion": "3.13",
+      "installCommunityGeneral": true,
+      "installSshSupport": true
+    }
+  },
+  {
+    "name": "runtime-python312",
+    "image": "ubuntu:24.04",
+    "options": {
+      "pythonVersion": "3.12",
+      "version": "6.4.0"
+    }
+  },
+  {
+    "name": "tools-rhel",
+    "image": "almalinux:10",
+    "options": {
+      "mode": "tools",
+      "pythonVersion": "3.12"
+    }
+  },
+  {
+    "name": "tools-minimal",
+    "image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+    "options": {
+      "mode": "tools",
+      "installSshSupport": true
+    }
+  },
+  {
+    "name": "source-workspace",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+    "options": {
+      "mode": "source"
+    },
+    "source": "baseline",
+    "user": "vscode",
+    "example": "source-workspace"
+  },
+  {
+    "name": "source-git",
+    "image": "almalinux:10",
+    "options": {
+      "mode": "source",
+      "sourceType": "git"
+    },
+    "source": "baseline"
+  },
+  {
+    "name": "source-minimal",
+    "image": "registry.access.redhat.com/ubi10/ubi-minimal:latest",
+    "options": {
+      "mode": "source",
+      "sourceType": "git",
+      "pythonVersion": "3.13"
+    },
+    "source": "baseline"
+  },
+  {
+    "name": "source-devel",
+    "image": "ubuntu:26.10",
+    "options": {
+      "mode": "source",
+      "sourceType": "git"
+    },
+    "source": "devel"
+  },
+  {
+    "name": "composition",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+    "options": {
+      "mode": "tools"
+    },
+    "user": "vscode",
+    "compose": true
+  },
+  {
+    "name": "uid-adjustment",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+    "options": {
+      "mode": "source",
+      "sourceType": "git"
+    },
+    "source": "baseline",
+    "user": "vscode",
+    "uidAdjustment": true
+  },
+  {
+    "name": "reinstall",
+    "image": "ubuntu:26.10",
+    "options": {
+      "mode": "runtime",
+      "pythonVersion": "3.14.10"
+    },
+    "reinstall": true
+  },
+  {
+    "name": "example-runtime",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+    "user": "vscode",
+    "options": {
+      "mode": "runtime"
+    },
+    "example": "runtime"
+  },
+  {
+    "name": "example-tools",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+    "user": "vscode",
+    "options": {
+      "mode": "tools"
+    },
+    "example": "tools"
+  },
+  {
+    "name": "example-source-git",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+    "user": "vscode",
+    "options": {
+      "mode": "source",
+      "sourceType": "git"
+    },
+    "example": "source-git",
+    "source": "baseline"
+  }
+]

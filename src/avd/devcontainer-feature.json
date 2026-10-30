@@ -1,0 +1,21 @@
+{
+  "id": "avd",
+  "version": "1.0.0",
+  "name": "Arista AVD",
+  "description": "Isolated managed Python, matching PyAVD and Ansible collections, and optional contributor tooling.",
+  "options": {
+    "mode": {"type": "string", "enum": ["runtime", "tools", "source"], "default": "runtime", "description": "Released runtime, inventory development tools, or editable AVD source."},
+    "version": {"type": "string", "default": "latest", "description": "Exact stable AVD >=6.4.0,<7.0.0, or latest stable release common to PyPI and Galaxy (runtime/tools)."},
+    "pythonVersion": {"type": "string", "default": "auto", "description": "Managed CPython minor or exact patch. Auto: 3.14 runtime/tools, 3.12 source. Runtime/tools: 3.12–3.14; source: 3.12–3.13."},
+    "sourceType": {"type": "string", "enum": ["workspace", "git"], "default": "workspace", "description": "Source checkout location (source only)."},
+    "sourcePath": {"type": "string", "default": ".", "description": "Workspace repository root relative to post-create working directory, or absolute path (source/workspace)."},
+    "sourceRepository": {"type": "string", "default": "https://github.com/aristanetworks/avd.git", "description": "HTTPS or SSH Git location without embedded credentials (source/git)."},
+    "sourceRef": {"type": "string", "default": "devel", "description": "Branch, tag, or commit to resolve (source/git)."},
+    "installCommunityGeneral": {"type": "boolean", "default": false, "description": "Add a community.general version compatible with the controller's Ansible."},
+    "installSshSupport": {"type": "boolean", "default": false, "description": "Add paramiko and ansible-pylibssh client transports; does not provide an SSH server."}
+  },
+  "containerEnv": {"PATH": "/opt/avd/venv/bin:${PATH}"},
+  "postCreateCommand": "/usr/local/bin/avd-setup-source",
+  "customizations": {"vscode": {"settings": {"python.defaultInterpreterPath": "/opt/avd/venv/bin/python"}, "extensions": ["ms-python.python", "redhat.ansible"]}},
+  "installsAfter": ["ghcr.io/devcontainers/features/common-utils", "ghcr.io/devcontainers/features/python"]
+}

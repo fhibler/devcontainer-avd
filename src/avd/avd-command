@@ -1,0 +1,3 @@
+#!/bin/sh
+# The bootstrap interpreter is available before source activation.
+exec /opt/avd/bootstrap-python /opt/avd/feature/avd_setup.py "$(basename "$0")" "$@"

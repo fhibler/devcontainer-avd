@@ -1,0 +1,13 @@
+{
+  "name": "AVD source-git",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "remoteUser": "vscode",
+  "features": {
+    "../../../src/avd": {
+      "mode": "source",
+      "sourceType": "git",
+      "sourceRef": "v6.4.0"
+    }
+  },
+  "waitFor": "postCreateCommand"
+}

@@ -1,0 +1,14 @@
+- name: Build an offline fabric
+  hosts: FABRIC
+  gather_facts: false
+  roles:
+    - arista.avd.eos_designs
+    - arista.avd.eos_cli_config_gen
+- name: Verify explicit localhost controller interpreter
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - name: Confirm controller Python
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.python.executable == ansible_playbook_python

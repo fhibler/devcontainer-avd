@@ -1,0 +1,31 @@
+fabric_name: FABRIC
+ansible_connection: local
+ansible_python_interpreter: "{{ ansible_playbook_python }}"
+underlay_routing_protocol: ebgp
+overlay_routing_protocol: ebgp
+mgmt_interface_settings:
+  interface: Management1
+mgmt_gateway: 192.0.2.1
+spine:
+  defaults:
+    platform: vEOS-lab
+    loopback_ipv4_pool: 10.255.0.0/24
+    bgp_as: 65000
+  nodes:
+    - name: avd-spine1
+      id: 1
+      mgmt_ip: 192.0.2.11/24
+l3leaf:
+  defaults:
+    platform: vEOS-lab
+    loopback_ipv4_pool: 10.255.1.0/24
+    vtep_loopback_ipv4_pool: 10.255.2.0/24
+    uplink_ipv4_pool: 10.255.3.0/24
+    uplink_interfaces: [Ethernet1]
+    uplink_switches: [avd-spine1]
+    uplink_switch_interfaces: [Ethernet1]
+  nodes:
+    - name: avd-leaf1
+      id: 1
+      bgp_as: 65101
+      mgmt_ip: 192.0.2.21/24

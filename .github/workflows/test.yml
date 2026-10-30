@@ -1,0 +1,152 @@
+name: Test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+    outputs:
+      version:
+        value: ${{ jobs.prepare.outputs.version }}
+      commit:
+        value: ${{ jobs.prepare.outputs.commit }}
+permissions:
+  contents: read
+concurrency:
+  group: test-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Load tool versions
+        run: cat scripts/versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+      - name: Install validation tools
+        run: bash scripts/install-ci-tools.sh
+      - name: Validate
+        run: bash scripts/validate.sh
+  prepare:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      images: ${{ steps.prepare.outputs.images }}
+      scenarios: ${{ steps.prepare.outputs.scenarios }}
+      version: ${{ steps.prepare.outputs.version }}
+      commit: ${{ steps.prepare.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Load tool versions
+        run: cat scripts/versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+      - run: npm install --global "@devcontainers/cli@$DEVCONTAINER_CLI"
+      - id: prepare
+        run: python3 scripts/ci.py prepare
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tested-feature
+          path: artifacts/
+          if-no-files-found: error
+  platform:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        image: ${{ fromJSON(needs.prepare.outputs.images) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tested-feature
+          path: artifacts
+      - name: Verify archive checksum
+        working-directory: artifacts
+        run: sha256sum -c SHA256SUMS
+      - name: Test native platform
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+        run: python3 scripts/ci.py platform "$TEST_IMAGE"
+      - name: Collect diagnostics
+        if: always()
+        run: docker ps -a > artifacts/containers.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: platform-${{ matrix.runner }}-${{ strategy.job-index }}
+          path: artifacts/
+  integration:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        scenario: ${{ fromJSON(needs.prepare.outputs.scenarios) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Load tool versions
+        run: cat scripts/versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+      - run: npm install --global "@devcontainers/cli@$DEVCONTAINER_CLI"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tested-feature
+          path: artifacts
+      - name: Verify archive checksum
+        working-directory: artifacts
+        run: sha256sum -c SHA256SUMS
+      - name: Test lifecycle and options
+        env:
+          SCENARIO: ${{ matrix.scenario.name }}
+        run: python3 scripts/ci.py scenario "$SCENARIO"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: integration-${{ matrix.runner }}-${{ matrix.scenario.name }}
+          path: artifacts/
+  required:
+    name: Required tests
+    if: always()
+    needs: [validate, prepare, platform, integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          assert all(job['result'] == 'success' for job in results.values()), results
+          PY

@@ -1,0 +1,10 @@
+/tmp/
+/.tools/
+/artifacts/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+/test/avd/inventory/intended/
+/test/avd/inventory/documentation/
+/test/config-precedence/

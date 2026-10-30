@@ -1,0 +1,11 @@
+{
+  "name": "AVD tools",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "remoteUser": "vscode",
+  "features": {
+    "../../../src/avd": {
+      "mode": "tools"
+    }
+  },
+  "waitFor": "postCreateCommand"
+}

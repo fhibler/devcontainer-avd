@@ -1,0 +1,188 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref in default branch history (empty selects default branch)
+        type: string
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: avd-release
+  cancel-in-progress: false
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Require trusted default-branch workflow
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: resolve
+        env:
+          SOURCE_REF: ${{ inputs.ref || github.event.repository.default_branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch -- origin "$SOURCE_REF"
+          commit=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+          git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"
+          git show "$commit:src/avd/devcontainer-feature.json" > /tmp/avd-feature.json
+          version=$(python3 -c 'import json, re; version=json.load(open("/tmp/avd-feature.json"))["version"]; assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version); print(version)')
+          printf 'commit=%s\nversion=%s\n' "$commit" "$version" >> "$GITHUB_OUTPUT"
+      - name: Refuse an existing release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FEATURE_VERSION: ${{ steps.resolve.outputs.version }}
+        run: python3 scripts/release.py preflight "$GITHUB_REPOSITORY" "$FEATURE_VERSION"
+  verify:
+    needs: resolve
+    permissions:
+      contents: read
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+  publish:
+    needs: [resolve, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Load tool versions
+        run: cat scripts/versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+      - run: npm install --global "@devcontainers/cli@$DEVCONTAINER_CLI"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tested-feature
+          path: artifacts
+      - name: Validate tested identity and extract payload
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.commit }}
+          FEATURE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          (cd artifacts && sha256sum -c SHA256SUMS)
+          python3 - <<'PY'
+          import json, os, pathlib, tarfile
+          p = json.load(open('artifacts/provenance.json'))
+          assert p['commit'] == os.environ['SOURCE_COMMIT']
+          assert p['feature_version'] == os.environ['FEATURE_VERSION']
+          pathlib.Path('artifacts/payload/avd').mkdir(parents=True)
+          with tarfile.open('artifacts/devcontainer-feature-avd.tgz') as archive:
+              archive.extractall('artifacts/payload/avd', filter='data')
+          PY
+      - name: Publish the tested Feature with official tooling
+        env:
+          DEVCONTAINERS_OCI_AUTH: ghcr.io,${{ github.actor }},${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          FEATURE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          python3 scripts/release.py preflight "$GITHUB_REPOSITORY" "$FEATURE_VERSION"
+          namespace=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          devcontainer features publish artifacts/payload --registry ghcr.io --namespace "$namespace"
+  published:
+    name: Verify published artifact
+    needs: [resolve, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      reference: ${{ steps.verify.outputs.reference }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tested-feature
+          path: artifacts
+      - id: verify
+        name: Verify published digest, payload, and anonymous access
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FEATURE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: python3 scripts/release.py verify "$GITHUB_REPOSITORY" "$FEATURE_VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: published-feature
+          path: artifacts/
+  consumer:
+    needs: published
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Load tool versions
+        run: cat scripts/versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_MAJOR }}
+      - run: npm install --global "@devcontainers/cli@$DEVCONTAINER_CLI"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tested-feature
+          path: artifacts
+      - name: Consume immutable published Feature anonymously
+        env:
+          FEATURE_REFERENCE: ${{ needs.published.outputs.reference }}
+        run: python3 scripts/consumer.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: consumer-${{ matrix.runner }}
+          path: artifacts/
+  summary:
+    if: always()
+    needs: [resolve, verify, publish, published, consumer]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record publication and all verification results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          FEATURE_REFERENCE: ${{ needs.published.outputs.reference }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(f"Source: {os.environ['SOURCE_COMMIT']}\n\nArtifact: {os.environ['FEATURE_REFERENCE']}\n\n")
+              out.write('Native consumer architectures: amd64, arm64.\n\n')
+              out.write(f"Verification: {os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}\n\n")
+              out.write('```json\n' + json.dumps(results, indent=2) + '\n```\n')
+              recovery = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/blob/{os.environ['SOURCE_COMMIT']}/docs/releases.md#recover-from-a-verification-failure"
+              out.write(f'If publication occurred and later checks failed, retain the digest and follow [release recovery]({recovery}); do not overwrite the version.\n')
+          assert all(job['result'] == 'success' for job in results.values()), results
+          PY
