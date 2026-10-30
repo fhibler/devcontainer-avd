@@ -93,7 +93,7 @@ jobs:
           PY
       - name: Publish the tested Feature with official tooling
         env:
-          DEVCONTAINERS_OCI_AUTH: ghcr.io,${{ github.actor }},${{ github.token }}
+          DEVCONTAINERS_OCI_AUTH: ghcr.io|${{ github.actor }}|${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
           FEATURE_VERSION: ${{ needs.resolve.outputs.version }}
         run: |
