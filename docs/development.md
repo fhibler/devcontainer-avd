@@ -54,6 +54,8 @@ The vendored Feature schema comes from the
 The [test workflow](../.github/workflows/test.yml) runs on every push, pull
 request, weekly schedule, manual request, and reusable call. It validates and
 packages once, then tests each platform image on both native architectures.
+The runner and test-group matrix axes expand independently, so every group runs
+on both amd64 and arm64.
 Known image-tag aliases share a job so BuildKit can reuse the install layer
 when tags resolve to the same digest. Every tag is still resolved and smoke
 checked. Image pulls get up to three attempts for transient network/server errors,

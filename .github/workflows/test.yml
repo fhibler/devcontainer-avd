@@ -66,13 +66,13 @@ jobs:
           path: artifacts/
           if-no-files-found: error
   platform:
-    name: Platform (${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}, ${{ join(fromJSON(matrix.images), ', ') }})
+    name: Platform (${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}, ${{ join(fromJSON(matrix.group.images), ', ') }})
     needs: prepare
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        include: ${{ fromJSON(needs.prepare.outputs.platform_groups) }}
+        group: ${{ fromJSON(needs.prepare.outputs.platform_groups) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 50
     steps:
@@ -89,7 +89,7 @@ jobs:
         run: sha256sum -c SHA256SUMS
       - name: Test native platform
         env:
-          TEST_IMAGES: ${{ matrix.images }}
+          TEST_IMAGES: ${{ matrix.group.images }}
         run: python3 scripts/ci.py platform-group "$TEST_IMAGES"
       - name: Collect diagnostics
         if: always()
@@ -97,16 +97,16 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: platform-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-${{ matrix.id }}
+          name: platform-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-${{ matrix.group.id }}
           path: artifacts/
   integration:
-    name: Integration (${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}, ${{ matrix.image }}, ${{ join(fromJSON(matrix.scenarios), ', ') }})
+    name: Integration (${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}, ${{ matrix.group.image }}, ${{ join(fromJSON(matrix.group.scenarios), ', ') }})
     needs: prepare
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        include: ${{ fromJSON(needs.prepare.outputs.scenario_groups) }}
+        group: ${{ fromJSON(needs.prepare.outputs.scenario_groups) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -129,12 +129,12 @@ jobs:
         run: sha256sum -c SHA256SUMS
       - name: Test lifecycle and options
         env:
-          SCENARIOS: ${{ matrix.scenarios }}
+          SCENARIOS: ${{ matrix.group.scenarios }}
         run: python3 scripts/ci.py scenario-group "$SCENARIOS"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: integration-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-${{ matrix.id }}
+          name: integration-${{ matrix.runner == 'ubuntu-24.04-arm' && 'arm64' || 'amd64' }}-${{ matrix.group.id }}
           path: artifacts/
   required:
     name: Required tests

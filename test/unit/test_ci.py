@@ -7,12 +7,70 @@ import os
 import subprocess
 import tempfile
 import unittest
+from collections import Counter
+from itertools import product
 from pathlib import Path
 from unittest.mock import call, patch
+
+import yaml
 
 SPEC = importlib.util.spec_from_file_location("ci", Path(__file__).resolve().parents[2] / "scripts/ci.py")
 ci = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ci)
+
+
+class WorkflowMatrix(unittest.TestCase):
+    def prepared_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            outputs = directory / "github-output"
+            # Packaging and release resolution are unrelated to matrix coverage.
+            (directory / "devcontainer-feature-avd.tgz").write_bytes(b"packaged feature")
+            with (
+                patch.object(ci, "ARTIFACTS", directory),
+                patch.dict(os.environ, {"GITHUB_OUTPUT": str(outputs)}),
+                patch.object(ci, "run", return_value="a" * 40),
+                patch.object(ci, "extract"),
+                patch.object(ci.setup, "resolve_release", return_value="6.4.0"),
+            ):
+                ci.prepare()
+            return dict(line.split("=", 1) for line in outputs.read_text().splitlines())
+
+    def expanded_jobs(self, job, output):
+        workflow = yaml.load((ci.ROOT / ".github/workflows/test.yml").read_text(), Loader=yaml.BaseLoader)
+        config = workflow["jobs"][job]
+        matrix = config["strategy"]["matrix"]
+        self.assertEqual(set(matrix), {"runner", "group"}, "Runner and group must be independent matrix axes")
+        self.assertEqual(matrix["group"], "${{ fromJSON(needs.prepare.outputs." + output + ") }}")
+        self.assertCountEqual(matrix["runner"], ["ubuntu-24.04", "ubuntu-24.04-arm"])
+        variable, field = ("TEST_IMAGES", "images") if job == "platform" else ("SCENARIOS", "scenarios")
+        selected = [step["env"][variable] for step in config["steps"] if variable in step.get("env", {})]
+        self.assertEqual(selected, ["${{ matrix.group." + field + " }}"])
+        uploads = [step for step in config["steps"] if step.get("uses", "").startswith("actions/upload-artifact@")]
+        self.assertEqual(len(uploads), 1)
+        self.assertIn("${{ matrix.group.id }}", uploads[0]["with"]["name"])
+        groups = json.loads(self.prepared_outputs()[output])
+        self.assertEqual(len({group["id"] for group in groups}), len(groups), "Artifact names must be unique")
+        return list(product(matrix["runner"], groups))
+
+    def test_every_platform_image_runs_once_on_each_architecture(self):
+        images = json.loads((ci.ROOT / "test/images.json").read_text())
+        jobs = self.expanded_jobs("platform", "platform_groups")
+        actual = Counter((runner, image) for runner, group in jobs for image in json.loads(group["images"]))
+        expected = Counter(product(["ubuntu-24.04", "ubuntu-24.04-arm"], images))
+        self.assertEqual(actual, expected)
+
+    def test_every_integration_scenario_runs_once_on_each_architecture(self):
+        scenarios = json.loads((ci.ROOT / "test/scenarios.json").read_text())
+        by_name = {scenario["name"]: scenario for scenario in scenarios}
+        jobs = self.expanded_jobs("integration", "scenario_groups")
+        actual = Counter()
+        for runner, group in jobs:
+            for name in json.loads(group["scenarios"]):
+                self.assertEqual(group["image"], by_name[name]["image"])
+                actual[runner, name] += 1
+        expected = Counter(product(["ubuntu-24.04", "ubuntu-24.04-arm"], by_name))
+        self.assertEqual(actual, expected)
 
 
 class ImageDownloads(unittest.TestCase):
