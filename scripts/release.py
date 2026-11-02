@@ -107,7 +107,7 @@ def package_exists(repository):
     return True
 
 
-def preflight(repository, version):
+def preflight(repository, version, overwrite_existing=False):
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
         raise ValueError("Feature version must be stable semantic X.Y.Z")
     path = registry_path(repository)
@@ -122,7 +122,10 @@ def preflight(repository, version):
             print(f"ghcr.io/{path}:{version} is available for first publication")
             return
         raise
-    raise ValueError(f"Exact version ghcr.io/{path}:{version} already exists; never overwrite it")
+    if overwrite_existing:
+        print(f"ghcr.io/{path}:{version} already exists; explicit overwrite selected")
+        return
+    raise ValueError(f"Exact version ghcr.io/{path}:{version} already exists; select overwrite to replace it")
 
 
 def alias_targets(path, token, version):
@@ -212,9 +215,12 @@ def main():
     parser.add_argument("command", choices=("preflight", "verify"))
     parser.add_argument("repository")
     parser.add_argument("version")
+    parser.add_argument(
+        "--overwrite-existing", action="store_true", help="Allow preflight when this exact GHCR version already exists"
+    )
     args = parser.parse_args()
     if args.command == "preflight":
-        preflight(args.repository, args.version)
+        preflight(args.repository, args.version, overwrite_existing=args.overwrite_existing)
     else:
         verify(args.repository, args.version)
 

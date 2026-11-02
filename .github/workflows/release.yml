@@ -6,6 +6,14 @@ on:
         description: Source ref in default branch history (empty selects default branch)
         type: string
         default: ''
+      overwrite_existing:
+        description: Replace the existing exact GHCR version tag
+        type: choice
+        required: true
+        default: 'no'
+        options:
+          - 'no'
+          - 'yes'
 permissions:
   contents: read
 concurrency:
@@ -42,11 +50,17 @@ jobs:
           git show "$commit:src/avd/devcontainer-feature.json" > /tmp/avd-feature.json
           version=$(python3 -c 'import json, re; version=json.load(open("/tmp/avd-feature.json"))["version"]; assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version); print(version)')
           printf 'commit=%s\nversion=%s\n' "$commit" "$version" >> "$GITHUB_OUTPUT"
-      - name: Refuse an existing release
+      - name: Check exact release version
         env:
           GITHUB_TOKEN: ${{ github.token }}
           FEATURE_VERSION: ${{ steps.resolve.outputs.version }}
-        run: python3 scripts/release.py preflight "$GITHUB_REPOSITORY" "$FEATURE_VERSION"
+          OVERWRITE_EXISTING: ${{ inputs.overwrite_existing }}
+        run: |
+          args=()
+          if [[ "$OVERWRITE_EXISTING" == "yes" ]]; then
+            args+=(--overwrite-existing)
+          fi
+          python3 scripts/release.py preflight "$GITHUB_REPOSITORY" "$FEATURE_VERSION" "${args[@]}"
   verify:
     needs: resolve
     permissions:
@@ -96,8 +110,13 @@ jobs:
           DEVCONTAINERS_OCI_AUTH: ghcr.io|${{ github.actor }}|${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
           FEATURE_VERSION: ${{ needs.resolve.outputs.version }}
+          OVERWRITE_EXISTING: ${{ inputs.overwrite_existing }}
         run: |
-          python3 scripts/release.py preflight "$GITHUB_REPOSITORY" "$FEATURE_VERSION"
+          args=()
+          if [[ "$OVERWRITE_EXISTING" == "yes" ]]; then
+            args+=(--overwrite-existing)
+          fi
+          python3 scripts/release.py preflight "$GITHUB_REPOSITORY" "$FEATURE_VERSION" "${args[@]}"
           namespace=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           devcontainer features publish artifacts/payload --registry ghcr.io --namespace "$namespace"
   published:

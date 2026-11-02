@@ -6,8 +6,11 @@ Only [release.yml](../.github/workflows/release.yml)'s manual dispatch publishes
 Dispatch it on the default branch and select a source ref from that branch's
 history; empty selects the default branch. The workflow resolves an immutable
 commit, reads the Feature's semantic version from metadata, refuses an existing
-exact version, reruns the complete read-only tests, and publishes the tested
-archive using the official pinned Dev Container CLI.
+exact version by default, reruns the complete read-only tests, and publishes
+the tested archive using the official pinned Dev Container CLI. The dispatch
+form has an **Overwrite existing version** dropdown set to `no` by default.
+Choose `yes` only when you intentionally want to replace that exact GHCR tag;
+the publish step repeats the same preflight with that explicit selection.
 
 The Feature namespace for this repository is
 `ghcr.io/fhibler/devcontainer-avd/avd`. The workflow derives and lowercases the
@@ -41,12 +44,13 @@ release.
 Registry publishing is not transactional. If checks after publication fail, the
 exact version and aliases may already exist. Retain the published digest and
 workflow artifacts, inspect the alias state with `devcontainer features info`,
-and investigate. Do not overwrite an exact version or assume a failed workflow
-unpublished it.
+and investigate. Do not select overwrite just to retry a partial release; rerun
+failed verification jobs or follow the recovery steps below.
 
 For a package-visibility failure, make the existing package public in GHCR
 settings, then rerun **failed jobs only**. The successful publishing job stays
 complete. Use the same retry for transient read-only verification failures.
 If the artifact itself needs correction, fix the implementation, increment the
 Feature version in metadata, update documentation, and publish the new version
-through the full release workflow.
+through the full release workflow. Select overwrite only when intentionally
+replacing an already published exact version.
