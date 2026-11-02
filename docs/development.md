@@ -56,9 +56,13 @@ request, weekly schedule, manual request, and reusable call. It validates and
 packages once, then tests each platform image on both native architectures.
 Known image-tag aliases share a job so BuildKit can reuse the install layer
 when tags resolve to the same digest. Every tag is still resolved and smoke
-checked. A platform build is capped at 20 minutes per image, and DNF refreshes
-metadata and retries once after an install failure. Job names show the
-architecture and image tags, and each group retains logs and artifacts.
+checked. Image pulls get up to three attempts for transient network/server errors,
+with a three-minute timeout per attempt. A platform build is capped at 20
+minutes per image. DNF and microdnf discard cached metadata between up to three
+install attempts, covering empty or malformed `repomd.xml` downloads. Bootstrap
+downloads also retry connection failures. Job names
+show the architecture and image tags; each group retains image-pull and build
+logs alongside its other artifacts. Smoke-test failures are not retried.
 
 Additional integration jobs cover modes, optional dependencies, Python
 selections, users/UID adjustment, official Feature composition, duplicate

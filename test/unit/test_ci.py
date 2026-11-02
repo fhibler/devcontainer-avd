@@ -4,14 +4,122 @@ import copy
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 SPEC = importlib.util.spec_from_file_location("ci", Path(__file__).resolve().parents[2] / "scripts/ci.py")
 ci = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ci)
+
+
+class ImageDownloads(unittest.TestCase):
+    def test_transient_pull_errors_recover(self):
+        for message in (
+            "dial tcp: lookup registry-1.docker.io: no such host",
+            "net/http: TLS handshake timeout",
+            "read: connection reset by peer",
+            "received unexpected HTTP status: 503 Service Unavailable",
+            "toomanyrequests: Too Many Requests",
+            "unexpected EOF",
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(
+                    ci, "run", side_effect=[subprocess.CalledProcessError(1, "pull", output=message), "ok"]
+                ) as run,
+                patch.object(ci.time, "sleep") as sleep,
+            ):
+                ci.pull_image("almalinux:9.8", Path(directory))
+                self.assertEqual(run.call_count, 2)
+                sleep.assert_called_once_with(2)
+                for invocation in run.call_args_list:
+                    self.assertEqual(invocation.args, (ci.ENGINE, "pull", "almalinux:9.8"))
+                    self.assertEqual(invocation.kwargs["timeout"], ci.IMAGE_PULL_TIMEOUT_SECONDS)
+
+    def test_persistent_network_errors_and_timeouts_remain_failures(self):
+        for error in (
+            subprocess.CalledProcessError(1, "pull", output="connection reset by peer"),
+            subprocess.TimeoutExpired("pull", ci.IMAGE_PULL_TIMEOUT_SECONDS),
+        ):
+            with (
+                self.subTest(error=error),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(ci, "run", side_effect=error) as run,
+                patch.object(ci.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(type(error)):
+                    ci.pull_image("almalinux:9.8", Path(directory))
+                self.assertEqual(run.call_count, 3)
+                self.assertEqual(sleep.call_args_list, [call(2), call(4)])
+
+    def test_permanent_pull_errors_fail_immediately(self):
+        for message in ("manifest unknown", "unauthorized: authentication required", "invalid reference format"):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(ci, "run", side_effect=subprocess.CalledProcessError(1, "pull", output=message)) as run,
+                patch.object(ci.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    ci.pull_image("almalinux:9.8", Path(directory))
+                run.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_failed_pull_is_not_cached(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(ci.IMAGE_IDENTITIES, {}, clear=True),
+            patch.object(ci, "pull_image", side_effect=subprocess.CalledProcessError(1, "pull")),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                ci.identity("almalinux:9.8", Path(directory))
+            self.assertNotIn("almalinux:9.8", ci.IMAGE_IDENTITIES)
+
+
+class DiagnosticLogs(unittest.TestCase):
+    def test_command_logs_survive_success_failure_and_timeout(self):
+        for boundary in (
+            subprocess.CompletedProcess(["build"], 0, "download completed"),
+            subprocess.CompletedProcess(["build"], 1, "download failed"),
+            subprocess.TimeoutExpired("build", 10, output=b"partial download output"),
+        ):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(ci, "ARTIFACTS", Path(directory)),
+                patch.object(ci, "ACTIVE_TEST_ARTIFACTS", None),
+                patch.object(
+                    ci.subprocess,
+                    "run",
+                    **({"side_effect": boundary} if isinstance(boundary, Exception) else {"return_value": boundary}),
+                ),
+            ):
+                log = Path(directory) / "build.log"
+                if isinstance(boundary, subprocess.TimeoutExpired):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        ci.run("build", log=log, timeout=10)
+                    self.assertIn("partial download output", log.read_text())
+                elif boundary.returncode:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        ci.run("build", log=log)
+                    self.assertIn(boundary.stdout, log.read_text())
+                else:
+                    self.assertEqual(ci.run("build", log=log), boundary.stdout)
+                    self.assertIn(boundary.stdout, log.read_text())
+
+    def test_saved_command_logs_are_redacted(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"TEST_TOKEN": "diagnostic-secret"}),
+            patch.object(ci.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "diagnostic-secret")),
+        ):
+            log = Path(directory) / "build.log"
+            ci.run("build", log=log)
+            self.assertEqual(log.read_text(), "[redacted]\n")
 
 
 class LifecycleConfiguration(unittest.TestCase):

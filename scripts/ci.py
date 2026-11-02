@@ -9,11 +9,13 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -23,6 +25,14 @@ ARTIFACTS = ROOT / "artifacts"
 ENGINE = os.environ.get("CONTAINER_ENGINE", "docker")
 MAX_SCENARIOS_PER_GROUP = 2
 PLATFORM_BUILD_TIMEOUT_SECONDS = 20 * 60
+IMAGE_PULL_TIMEOUT_SECONDS = 3 * 60
+DOWNLOAD_ATTEMPTS = 3
+TRANSIENT_PULL_ERROR = re.compile(
+    r"timeout|timed out|temporary failure|no such host|connection (?:reset|refused|aborted)|"
+    r"network is unreachable|unexpected EOF|TLS handshake|too many requests|"
+    r"\b(?:429|500|502|503|504)\b|service unavailable|bad gateway|gateway timeout",
+    re.IGNORECASE,
+)
 ACTIVE_TEST_ARTIFACTS = None
 IMAGE_IDENTITIES = {}
 # Co-locate tags that commonly resolve to the same image so BuildKit can reuse
@@ -42,10 +52,22 @@ sys.dont_write_bytecode = True
 spec.loader.exec_module(setup)
 
 
-def run(*args, **kwargs):
+def run(*args, log=None, **kwargs):
     print("+", setup.redact(" ".join(map(str, args))), flush=True)
-    result = subprocess.run(list(map(str, args)), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+    try:
+        result = subprocess.run(
+            list(map(str, args)), text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs
+        )
+    except subprocess.TimeoutExpired as exc:
+        if log is not None:
+            output = exc.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
+            log.write_text(setup.redact(output) + "\n")
+        raise
     output = result.stdout.strip()
+    if log is not None:
+        log.write_text(setup.redact(output) + "\n")
     if result.returncode:
         output = setup.redact(output)
         failure_dir = ACTIVE_TEST_ARTIFACTS or ARTIFACTS
@@ -107,9 +129,7 @@ def group_platform_images(images):
     for group_id, aliases in PLATFORM_IMAGE_ALIAS_GROUPS:
         group_images = [image for image in aliases if image in remaining]
         if len(group_images) > 1:
-            groups.append(
-                {"id": group_id, "images": json.dumps(group_images, separators=(",", ":"))}
-            )
+            groups.append({"id": group_id, "images": json.dumps(group_images, separators=(",", ":"))})
             remaining.difference_update(group_images)
     for image in images:
         if image in remaining:
@@ -154,16 +174,8 @@ def prepare():
         images = json.loads((ROOT / "test/images.json").read_text())
         scenarios = json.loads((ROOT / "test/scenarios.json").read_text())
         with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
-            handle.write(
-                "platform_groups="
-                + json.dumps(group_platform_images(images), separators=(",", ":"))
-                + "\n"
-            )
-            handle.write(
-                "scenario_groups="
-                + json.dumps(group_scenarios(scenarios), separators=(",", ":"))
-                + "\n"
-            )
+            handle.write("platform_groups=" + json.dumps(group_platform_images(images), separators=(",", ":")) + "\n")
+            handle.write("scenario_groups=" + json.dumps(group_scenarios(scenarios), separators=(",", ":")) + "\n")
             handle.write(f"version={feature['version']}\ncommit={run('git', 'rev-parse', 'HEAD')}\n")
     with tempfile.TemporaryDirectory() as directory:
         extract(archive, Path(directory))
@@ -177,9 +189,24 @@ def native_arch():
     return arch
 
 
+def pull_image(image, log):
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            run(ENGINE, "pull", image, timeout=IMAGE_PULL_TIMEOUT_SECONDS, log=log / f"pull-attempt-{attempt}.log")
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            if isinstance(exc, subprocess.CalledProcessError) and not TRANSIENT_PULL_ERROR.search(exc.output or ""):
+                raise
+            delay = 2**attempt
+            print(f"Image pull failed transiently; retrying in {delay}s ({attempt}/{DOWNLOAD_ATTEMPTS}).", flush=True)
+            time.sleep(delay)
+
+
 def identity(image, log):
     if image not in IMAGE_IDENTITIES:
-        run(ENGINE, "pull", image)
+        pull_image(image, log)
         IMAGE_IDENTITIES[image] = json.loads(run(ENGINE, "image", "inspect", image))[0]
     details = IMAGE_IDENTITIES[image]
     write(log / "image.json", {key: details.get(key) for key in ("Id", "RepoDigests", "Architecture", "Os")})
@@ -247,11 +274,18 @@ def platform_smoke(image):
         tag = "avd-platform-" + uuid.uuid4().hex
         container = "avd-platform-" + uuid.uuid4().hex
         try:
-            subprocess.run(
-                [ENGINE, "build", "-t", tag, "-f", str(dockerfile), str(directory)],
-                check=True,
+            output = run(
+                ENGINE,
+                "build",
+                "-t",
+                tag,
+                "-f",
+                dockerfile,
+                directory,
                 timeout=PLATFORM_BUILD_TIMEOUT_SECONDS,
+                log=log / "build.log",
             )
+            print(setup.redact(output), flush=True)
             run(ENGINE, "create", "--name", container, tag, "sleep", "infinity")
             run(ENGINE, "start", container)
             (log / "manifest.json").write_text(run(ENGINE, "exec", container, "avd-info", "--json"))

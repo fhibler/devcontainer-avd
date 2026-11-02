@@ -191,19 +191,29 @@ if [ "$family" = rhel ]; then
     if rpm -q --quiet curl; then rhel_curl=curl; fi
     if rpm -q --quiet coreutils-single; then rhel_coreutils=coreutils-single; fi
 fi
-install_dnf_packages() {
-    local attempt
-    for attempt in 1 2; do
-        if dnf --setopt=retries=3 --setopt=timeout=30 install -y "$@"; then
+install_rhel_packages() {
+    local manager=$1 attempt status cache=metadata
+    local network_options=(--setopt=retries=3 --setopt=timeout=30)
+    shift
+    # microdnf needs repository-scoped network options and only supports clean all.
+    if [ "$manager" = microdnf ]; then
+        cache=all
+        network_options=('--setopt=*.retries=3' '--setopt=*.timeout=30')
+    fi
+    for attempt in 1 2 3; do
+        if "$manager" "${network_options[@]}" install -y "$@"; then
             return 0
+        else
+            status=$?
         fi
-        if [ "$attempt" -eq 1 ]; then
-            printf '%s\n' 'AVD: DNF package install failed; refreshing metadata and retrying once.' >&2
-            dnf clean metadata || true
-            sleep 2
+        if [ "$attempt" -lt 3 ]; then
+            printf 'AVD: %s package install failed (attempt %s/3); refreshing metadata and retrying.\n' "$manager" "$attempt" >&2
+            # Download retries alone cannot repair an empty/corrupt repomd.xml.
+            "$manager" clean "$cache" || true
+            sleep "$((2 ** attempt))"
         fi
     done
-    return 1
+    return "$status"
 }
 if [ "$family" = debian ]; then
     export DEBIAN_FRONTEND=noninteractive
@@ -211,10 +221,10 @@ if [ "$family" = debian ]; then
     apt-get install -y --no-install-recommends ca-certificates curl git make tar gzip unzip coreutils findutils openssh-client "${source_packages[@]}"
     rm -rf /var/lib/apt/lists/*
 elif command -v dnf >/dev/null 2>&1; then
-    install_dnf_packages ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"
+    install_rhel_packages dnf ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"
     dnf clean all
 elif command -v microdnf >/dev/null 2>&1; then
-    microdnf install -y ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"
+    install_rhel_packages microdnf ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"
     microdnf clean all
 else
     echo 'AVD: supported RHEL image must supply dnf or microdnf.' >&2
@@ -228,7 +238,8 @@ feature_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 install -d -m 0755 /opt/avd/feature /opt/avd/bootstrap /opt/avd/python
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-curl --fail --silent --show-error --location --connect-timeout 20 --max-time 180 --retry 2 \
+curl --fail --silent --show-error --location --connect-timeout 20 --max-time 180 \
+    --retry 3 --retry-all-errors --retry-max-time 300 \
     "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${target}-unknown-linux-gnu.tar.gz" -o "$work/uv.tar.gz"
 if [ "$arch" = amd64 ]; then checksum=$UV_SHA256_AMD64; else checksum=$UV_SHA256_ARM64; fi
 if ! printf '%s  %s\n' "$checksum" "$work/uv.tar.gz" | sha256sum --check --status; then

@@ -36,6 +36,76 @@ selected for the editor.
 The `:1` tag selects the Feature's major version; `:1.0.0` pins Feature 1.0.0.
 The `version` option below separately selects the AVD release.
 
+## Tested images and base image choices
+
+The [GitHub test workflow](.github/workflows/test.yml) tests images on native
+**amd64 and arm64** in two matrices: platform checks use the 30 distribution
+images in [test/images.json](test/images.json), and Dev Container integration
+tests use [test/scenarios.json](test/scenarios.json), including the Microsoft
+Dev Container base image below and selected distribution images.
+
+Repositories below include the registry and namespace; `docker.io/library/`
+is implicit in the short Docker Hub names used by CI. Combine the repository
+and tag as `repository:tag` to use any tested image in `devcontainer.json`.
+
+| Image repository | Tested tags | Suggested `image` value |
+| --- | --- | --- |
+| `mcr.microsoft.com/devcontainers/base` | `ubuntu-24.04` | `mcr.microsoft.com/devcontainers/base:ubuntu-24.04` |
+| `docker.io/library/debian` | `12`, `12-slim`, `13`, `13-slim`, `latest`, `stable-slim` | `docker.io/library/debian:13` |
+| `docker.io/library/ubuntu` | `22.04`, `24.04`, `26.04`, `26.10`, `latest`, `rolling` | `docker.io/library/ubuntu:24.04` |
+| `docker.io/library/almalinux` | `9`, `9-minimal`, `10`, `10-minimal`, `9.8`, `10.2`, `latest` | `docker.io/library/almalinux:10` |
+| `quay.io/rockylinux/rockylinux` | `9`, `9-minimal`, `10`, `10-minimal`, `10.2` | `quay.io/rockylinux/rockylinux:10` |
+| `registry.access.redhat.com/ubi9/ubi` | `latest` | `registry.access.redhat.com/ubi9/ubi:latest` |
+| `registry.access.redhat.com/ubi9/ubi-minimal` | `latest` | `registry.access.redhat.com/ubi9/ubi-minimal:latest` |
+| `registry.access.redhat.com/ubi10/ubi` | `latest` | `registry.access.redhat.com/ubi10/ubi:latest` |
+| `registry.access.redhat.com/ubi10/ubi-minimal` | `latest` | `registry.access.redhat.com/ubi10/ubi-minimal:latest` |
+| `quay.io/centos/centos` | `stream9`, `stream10` | `quay.io/centos/centos:stream10` |
+
+For a ready-to-use development environment, use
+`"image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04"`, as in the first
+example. It includes the `vscode` user and is also tested on both architectures
+through the [integration scenarios](test/scenarios.json), including all four
+runnable examples.
+
+The complete Dev Container integration matrix uses these seven base images:
+
+| Base image | Integration scenarios |
+| --- | --- |
+| `mcr.microsoft.com/devcontainers/base:ubuntu-24.04` | `source-workspace`, `composition`, `uid-adjustment`, `example-runtime`, `example-tools`, `example-source-git` |
+| `docker.io/library/debian:13` | `tools-debian` |
+| `docker.io/library/ubuntu:24.04` | `runtime-python312` |
+| `docker.io/library/ubuntu:26.10` | `source-devel`, `reinstall` |
+| `docker.io/library/almalinux:10` | `tools-rhel`, `source-git` |
+| `registry.access.redhat.com/ubi9/ubi-minimal:latest` | `tools-minimal` |
+| `registry.access.redhat.com/ubi10/ubi-minimal:latest` | `source-minimal` |
+
+The [release workflow](.github/workflows/release.yml) reruns the platform and
+integration matrices, then checks the published Feature with
+`docker.io/library/ubuntu:26.10` on both architectures through
+[scripts/consumer.py](scripts/consumer.py). This adds no further base images:
+the tables above cover all **31 distinct base-image tags** used by the tests.
+The `ubuntu-24.04` and `ubuntu-24.04-arm` values in `runs-on` select GitHub-hosted
+runner machines; container base images come from the matrices above.
+
+For a plain distribution base, use an `image` value from the table. For example,
+an AlmaLinux-based `.devcontainer/devcontainer.json`:
+
+```json
+{
+  "name": "AVD on AlmaLinux",
+  "image": "docker.io/library/almalinux:10",
+  "features": {
+    "ghcr.io/fhibler/devcontainer-avd/avd:1": {}
+  }
+}
+```
+
+Plain distribution images do not include the `vscode` user. Omit
+`"remoteUser": "vscode"` unless you create that user separately. Prefer versioned
+tags for a predictable distribution release; `latest`, `rolling`, and other
+moving tags can change. See the [platform matrix](docs/platforms.md) for
+verification details.
+
 ## Choose a mode
 
 | `mode` | Use it for | Included |
