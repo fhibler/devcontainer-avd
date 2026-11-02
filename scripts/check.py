@@ -82,7 +82,7 @@ def main():
                 assert (path.parent / target).exists(), (path, target)
     workflows = {path.name: path.read_text() for path in ROOT.glob(".github/workflows/*.yml")}
     test_workflow = yaml.load(workflows["test.yml"], Loader=yaml.BaseLoader)
-    assert set(test_workflow["on"]) == {"push", "pull_request", "workflow_dispatch", "schedule", "workflow_call"}
+    assert set(test_workflow["on"]) == {"push", "pull_request", "workflow_dispatch", "workflow_call"}
     assert not test_workflow["on"]["push"] and not test_workflow["on"]["pull_request"], (
         "Per-commit verification must have no filters"
     )
