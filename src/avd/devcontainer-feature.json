@@ -1,6 +1,6 @@
 {
   "id": "avd",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "name": "Arista AVD",
   "description": "Isolated managed Python, matching PyAVD and Ansible collections, and optional contributor tooling.",
   "options": {

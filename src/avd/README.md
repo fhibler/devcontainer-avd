@@ -1,4 +1,4 @@
-# avd Feature 1.0.0
+# avd Feature 1.0.1
 
 An isolated Arista AVD controller with runtime, tools, and editable source modes
 for Debian, Ubuntu, and RHEL-family containers on Linux amd64 and arm64.

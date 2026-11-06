@@ -33,7 +33,7 @@ container, run `avd-info` to inspect installed versions, or use `ansible-playboo
 and `anta` directly. Python packages use `/opt/avd/venv/bin/python`, which is also
 selected for the editor.
 
-The `:1` tag selects the Feature's major version; `:1.0.0` pins Feature 1.0.0.
+The `:1` tag selects the Feature's major version; `:1.0.1` pins Feature 1.0.1.
 The `version` option below separately selects the AVD release.
 
 ## Tested images and base image choices
