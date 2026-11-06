@@ -193,12 +193,13 @@ if [ "$family" = rhel ]; then
 fi
 install_rhel_packages() {
     local manager=$1 attempt status cache=metadata
-    local network_options=(--setopt=retries=3 --setopt=timeout=30)
+    # This transaction wrapper owns retries; avoid multiplying attempts inside DNF.
+    local network_options=(--setopt=retries=1 --setopt=timeout=30)
     shift
     # microdnf needs repository-scoped network options and only supports clean all.
     if [ "$manager" = microdnf ]; then
         cache=all
-        network_options=('--setopt=*.retries=3' '--setopt=*.timeout=30')
+        network_options=('--setopt=*.retries=1' '--setopt=*.timeout=30')
     fi
     for attempt in 1 2 3; do
         if "$manager" "${network_options[@]}" install -y "$@"; then
@@ -217,8 +218,9 @@ install_rhel_packages() {
 }
 if [ "$family" = debian ]; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends ca-certificates curl git make tar gzip unzip coreutils findutils openssh-client "${source_packages[@]}"
+    apt_network=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+    apt-get "${apt_network[@]}" -o APT::Update::Error-Mode=any update
+    apt-get "${apt_network[@]}" install -y --no-install-recommends ca-certificates curl git make tar gzip unzip coreutils findutils openssh-client "${source_packages[@]}"
     rm -rf /var/lib/apt/lists/*
 elif command -v dnf >/dev/null 2>&1; then
     install_rhel_packages dnf ca-certificates "$rhel_curl" git-core make tar gzip unzip "$rhel_coreutils" findutils openssh-clients "${source_packages[@]}"
@@ -238,22 +240,46 @@ feature_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 install -d -m 0755 /opt/avd/feature /opt/avd/bootstrap /opt/avd/python
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-curl --fail --silent --show-error --location --connect-timeout 20 --max-time 180 \
-    --retry 3 --retry-all-errors --retry-max-time 300 \
-    "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${target}-unknown-linux-gnu.tar.gz" -o "$work/uv.tar.gz"
+download_cache=${AVD_DOWNLOAD_CACHE-/opt/avd/download-cache}
+uv_archive="bootstrap/uv-${UV_VERSION}-${arch}.tar.gz"
+if [ -n "$download_cache" ] && [ -d "$download_cache" ]; then
+    # Verify prepared inputs before executing or copying anything from them.
+    (cd "$download_cache" && sha256sum --check --status SHA256SUMS)
+fi
+if [ -n "$download_cache" ] && [ -f "$download_cache/$uv_archive" ]; then
+    cp "$download_cache/$uv_archive" "$work/uv.tar.gz"
+else
+    curl --fail --silent --show-error --location --connect-timeout 20 --max-time 180 \
+        --retry 2 --retry-all-errors --retry-max-time 300 \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${target}-unknown-linux-gnu.tar.gz" -o "$work/uv.tar.gz"
+fi
 if [ "$arch" = amd64 ]; then checksum=$UV_SHA256_AMD64; else checksum=$UV_SHA256_ARM64; fi
 if ! printf '%s  %s\n' "$checksum" "$work/uv.tar.gz" | sha256sum --check --status; then
     echo 'AVD: uv archive checksum mismatch; refusing execution.' >&2
     exit 1
 fi
+if [ -n "${AVD_CACHE_RECORD-}" ]; then
+    mkdir -p "$AVD_CACHE_RECORD/bootstrap"
+    cp "$work/uv.tar.gz" "$AVD_CACHE_RECORD/$uv_archive"
+fi
 # Only execute the archive after checksum verification.
 tar -xzf "$work/uv.tar.gz" --strip-components=1 -C "$work" "uv-${target}-unknown-linux-gnu/uv"
 install -m 0755 "$work/uv" /opt/avd/bootstrap/uv
 export UV_PYTHON_INSTALL_DIR=/opt/avd/python UV_PYTHON_PREFERENCE=only-managed UV_PYTHON_DOWNLOADS=automatic UV_CACHE_DIR=/opt/avd/cache/uv
-/opt/avd/bootstrap/uv python install "$python_request" --no-bin --no-progress
+export UV_HTTP_RETRIES=2 UV_HTTP_TIMEOUT=60
+if [ -n "$download_cache" ] && [ -d "$download_cache/python" ]; then
+    for archive in "$download_cache"/python/*.tar.gz; do
+        [ -f "$archive" ] || continue
+        tar -xzf "$archive" -C /opt/avd/python
+    done
+fi
+python_flags=()
+# Warm floating minors against today's upstream index, even after restoring a cache.
+if [ -n "${AVD_CACHE_RECORD-}" ] && [[ "$python_request" =~ ^3\.[0-9]+$ ]]; then python_flags+=(--upgrade); fi
+/opt/avd/bootstrap/uv python install "$python_request" --no-bin --no-progress "${python_flags[@]}"
 python_path=$(/opt/avd/bootstrap/uv python find "$python_request")
 ln -sfn "$python_path" /opt/avd/bootstrap-python
-cp "$feature_dir/avd_setup.py" "$feature_dir/devcontainer-feature.json" "$feature_dir/bootstrap.env" "$feature_dir/tooling-requirements.txt" /opt/avd/feature/
+cp "$feature_dir/avd_setup.py" "$feature_dir/avd_cache.py" "$feature_dir/devcontainer-feature.json" "$feature_dir/bootstrap.env" "$feature_dir/tooling-requirements.txt" /opt/avd/feature/
 install -m 0755 "$feature_dir/avd-command" /usr/local/bin/avd-info
 install -m 0755 "$feature_dir/avd-command" /usr/local/bin/avd-setup-source
 phase=environment

@@ -13,6 +13,69 @@ from test_setup import avd
 
 
 class GitSource(unittest.TestCase):
+    def test_partial_clone_is_discarded_before_retry_and_tags_remain_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            upstream = root / "upstream"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "-b", "main", upstream], check=True, capture_output=True)
+            (upstream / "tracked").write_text("fixture\n")
+            subprocess.run(["git", "-C", upstream, "add", "tracked"], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    upstream,
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.test",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", upstream, "tag", "fixture"], check=True)
+            config = {
+                "user_home": str(root / "home"),
+                "options": {
+                    "sourceType": "git",
+                    "sourceRepository": "https://example.test/avd.git",
+                    "sourceRef": "fixture",
+                },
+            }
+            env = {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"url.{upstream}.insteadOf",
+                "GIT_CONFIG_VALUE_0": "https://example.test/avd.git",
+            }
+            original = subprocess.run
+            clones = 0
+
+            def interrupted_download(args, **kwargs):
+                nonlocal clones
+                if args[:2] == ["git", "clone"]:
+                    clones += 1
+                    if clones == 1:
+                        partial = Path(args[-1])
+                        partial.mkdir()
+                        (partial / "incomplete-download").touch()
+                        return subprocess.CompletedProcess(args, 1, "connection reset by peer")
+                return original(args, **kwargs)
+
+            with (
+                patch.dict(os.environ, env),
+                patch.object(avd.subprocess, "run", side_effect=interrupted_download),
+                patch.object(avd.time, "sleep"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                source = avd.checkout(config)
+            self.assertEqual(clones, 2)
+            self.assertEqual((source / "tracked").read_text(), "fixture\n")
+            self.assertFalse((source / "incomplete-download").exists())
+
     def test_reuse_dirty_checkout_and_ref_conflict(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

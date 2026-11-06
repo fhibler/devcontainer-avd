@@ -74,6 +74,17 @@ class WorkflowMatrix(unittest.TestCase):
 
 
 class ImageDownloads(unittest.TestCase):
+    def test_git_fetch_retries_transport_failure_but_not_missing_ref(self):
+        for message, attempts in (("connection reset by peer", 3), ("couldn't find remote ref missing", 1)):
+            with (
+                self.subTest(message=message),
+                patch.object(ci, "run", side_effect=subprocess.CalledProcessError(1, "git", output=message)) as run,
+                patch.object(ci.setup.time, "sleep"),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    ci.download("git", "fetch", "origin", "main")
+                self.assertEqual(run.call_count, attempts)
+
     def test_transient_pull_errors_recover(self):
         for message in (
             "dial tcp: lookup registry-1.docker.io: no such host",
@@ -136,6 +147,61 @@ class ImageDownloads(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 ci.identity("almalinux:9.8", Path(directory))
             self.assertNotIn("almalinux:9.8", ci.IMAGE_IDENTITIES)
+
+
+class BuildCaches(unittest.TestCase):
+    def test_restore_replace_and_failed_export_preserve_the_last_good_cache(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"AVD_BUILD_CACHE": directory}):
+            with ci.build_cache("image@sha256:one") as args:
+                self.assertNotIn("--cache-from", args)
+                destination = Path(args[-1].split("dest=", 1)[1].split(",", 1)[0])
+                destination.mkdir()
+                (destination / "index.json").write_text("first")
+                (destination / "obsolete-blob").touch()
+            with ci.build_cache("image@sha256:one") as args:
+                self.assertIn("--cache-from", args)
+                restored = Path(args[1].removeprefix("type=local,src="))
+                self.assertEqual((restored / "index.json").read_text(), "first")
+                destination.mkdir()
+                (destination / "index.json").write_text("second")
+            self.assertFalse((restored / "obsolete-blob").exists())
+            with self.assertRaisesRegex(RuntimeError, "build failed"), ci.build_cache("image@sha256:one"):
+                destination.mkdir()
+                (destination / "index.json").write_text("partial")
+                raise RuntimeError("build failed")
+            self.assertEqual((restored / "index.json").read_text(), "second")
+            self.assertFalse(destination.exists())
+            with ci.build_cache("image@sha256:two") as args:
+                self.assertNotIn("--cache-from", args)
+                destination = Path(args[-1].split("dest=", 1)[1].split(",", 1)[0])
+                destination.mkdir()
+                (destination / "index.json").write_text("different base")
+
+    def test_cache_misses_do_not_require_a_preexisting_directory(self):
+        with patch.dict(os.environ, {"AVD_BUILD_CACHE": ""}), ci.build_cache("image") as args:
+            self.assertEqual(args, [])
+
+    def test_dependency_changes_and_daily_refresh_invalidate_install_layers(self):
+        provenance = {"avd": "6.4.0", "baseline": "a", "devel": "b", "tools": {"UV": "1"}, "cache_epoch": "2026-11-06"}
+        original = ci.build_cache_key(provenance)
+        for key, value in (("avd", "6.5.0"), ("devel", "c"), ("tools", {"UV": "2"}), ("cache_epoch", "2026-11-07")):
+            with self.subTest(key=key):
+                self.assertNotEqual(ci.build_cache_key({**provenance, key: value}), original)
+        self.assertEqual(ci.build_cache_key(dict(reversed(list(provenance.items())))), original)
+
+    def test_workflow_cache_is_scoped_to_architecture_and_group_and_saved_only_from_default_branch(self):
+        workflow = yaml.load((ci.ROOT / ".github/workflows/test.yml").read_text(), Loader=yaml.BaseLoader)
+        for job in ("platform", "integration"):
+            steps = workflow["jobs"][job]["steps"]
+            restore = next(step for step in steps if step.get("uses", "").startswith("actions/cache/restore@"))
+            save = next(step for step in steps if step.get("uses", "").startswith("actions/cache/save@"))
+            for prefix in restore["with"]["restore-keys"].splitlines():
+                self.assertIn("${{ runner.arch }}", prefix)
+                self.assertIn(job + "-${{ matrix.group.id }}", prefix)
+                self.assertIn("${{ needs.prepare.outputs.cache_key }}", prefix)
+            self.assertIn("success()", save["if"])
+            self.assertIn("github.event_name != 'pull_request'", save["if"])
+            self.assertIn("github.event.repository.default_branch", save["if"])
 
 
 class DiagnosticLogs(unittest.TestCase):

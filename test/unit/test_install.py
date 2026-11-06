@@ -46,7 +46,7 @@ install_rhel_packages "$manager" ca-certificates 'package with spaces'
                 self.assertNotIn("manager: clean", result.stdout)
                 self.assertNotIn("sleep:", result.stdout)
                 scope = "*." if manager == "microdnf" else ""
-                self.assertIn(f"--setopt={scope}retries=3 --setopt={scope}timeout=30", result.stdout)
+                self.assertIn(f"--setopt={scope}retries=1 --setopt={scope}timeout=30", result.stdout)
 
     def test_failed_downloads_refresh_metadata_and_recover(self):
         for manager in ("dnf", "microdnf"):

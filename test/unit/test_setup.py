@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 SPEC = importlib.util.spec_from_file_location("avd_setup", Path(__file__).resolve().parents[2] / "src/avd/avd_setup.py")
 avd = importlib.util.module_from_spec(SPEC)
@@ -111,6 +111,83 @@ class ReleaseSelection(unittest.TestCase):
 
 
 class FailureBoundaries(unittest.TestCase):
+    def test_truncated_metadata_response_recovers_but_malformed_json_does_not_retry(self):
+        with (
+            patch.object(
+                avd.urllib.request,
+                "urlopen",
+                side_effect=[avd.http.client.IncompleteRead(b"partial", 100), io.BytesIO(b'{"ok": true}')],
+            ) as request,
+            patch.object(avd.time, "sleep") as sleep,
+        ):
+            self.assertEqual(avd.http_json(avd.PYPI), {"ok": True})
+            self.assertEqual(request.call_count, 2)
+            sleep.assert_called_once_with(2)
+        with (
+            patch.object(avd.urllib.request, "urlopen", return_value=io.BytesIO(b"invalid JSON")) as request,
+            patch.object(avd.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(avd.SetupError, "Malformed JSON"):
+                avd.http_json(avd.PYPI)
+            request.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_galaxy_download_retries_twice_then_recovers(self):
+        failed = subprocess.CompletedProcess([], 1, "IncompleteRead(7723 bytes read, 20337 more expected)")
+        with (
+            patch.object(
+                avd.subprocess, "run", side_effect=[failed, failed, subprocess.CompletedProcess([], 0, "ready")]
+            ) as command,
+            patch.object(avd.time, "sleep") as sleep,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(avd.run(["ansible-galaxy", "collection", "install"], download=True, timeout=300), "ready")
+            self.assertEqual(command.call_count, 3)
+            self.assertTrue(all(invocation.kwargs["timeout"] == 300 for invocation in command.call_args_list))
+            self.assertEqual(sleep.call_args_list, [call(2), call(4)])
+            self.assertIn("attempt 2/3", output.getvalue())
+
+    def test_failed_downloads_stop_after_three_attempts(self):
+        for failure in (
+            subprocess.CompletedProcess([], 1, "HTTP Error 503: Service Unavailable"),
+            subprocess.TimeoutExpired("ansible-galaxy", 300, output=b"partial output"),
+        ):
+            with (
+                self.subTest(failure=failure),
+                patch.object(
+                    avd.subprocess,
+                    "run",
+                    **({"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}),
+                ) as command,
+                patch.object(avd.time, "sleep") as sleep,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(avd.SetupError):
+                    avd.run(["ansible-galaxy"], download=True, timeout=300)
+                self.assertEqual(command.call_count, 3)
+                self.assertEqual(sleep.call_args_list, [call(2), call(4)])
+
+    def test_permanent_install_errors_and_other_commands_are_not_retried(self):
+        for message, download in (
+            ("HTTP Error 403: Forbidden", True),
+            ("dependency conflict", True),
+            ("No matching distribution found", True),
+            ("IncompleteRead\nchecksum mismatch", True),
+            ("IncompleteRead", False),
+        ):
+            with (
+                self.subTest(message=message, download=download),
+                patch.object(
+                    avd.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, message)
+                ) as command,
+                patch.object(avd.time, "sleep") as sleep,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(avd.SetupError):
+                    avd.run(["tool"], download=download)
+                command.assert_called_once()
+                sleep.assert_not_called()
+
     def test_transient_http_only_is_retried(self):
         import urllib.error
 

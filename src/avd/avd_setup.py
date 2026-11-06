@@ -7,6 +7,8 @@ import argparse
 import contextlib
 import datetime
 import hashlib
+import http.client
+import importlib.util
 import json
 import os
 import pwd
@@ -24,6 +26,9 @@ from pathlib import Path
 
 PREFIX = Path("/opt/avd")
 PAYLOAD = Path(__file__).resolve().parent
+_cache_spec = importlib.util.spec_from_file_location("avd_cache", PAYLOAD / "avd_cache.py")
+cache = importlib.util.module_from_spec(_cache_spec)
+_cache_spec.loader.exec_module(cache)
 UV = PREFIX / "bootstrap/uv"
 VENV = PREFIX / "venv"
 CONFIG = PREFIX / "config.json"
@@ -31,6 +36,23 @@ PYPI = "https://pypi.org/pypi/pyavd/json"
 GALAXY = "https://galaxy.ansible.com"
 STABLE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 TOOLS = ("ansible-lint", "yamllint", "ruff", "pre-commit", "pytest", "tox", "molecule", "molecule-plugins")
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_TIMEOUT = 300
+TRANSIENT_DOWNLOAD_ERROR = re.compile(
+    r"IncompleteRead|incomplete (?:read|download)|unexpected (?:EOF|end of (?:file|stream))|"
+    r"connection (?:reset|refused|aborted|closed)|remote (?:end closed|disconnected)|"
+    r"timeout|timed out|temporary failure|no such host|name or service not known|"
+    r"network is unreachable|TLS handshake|error sending request|failed to lookup address|"
+    r"(?:HTTP(?: Error| status(?: code)?)?|requested URL returned error)[\s:=]+(?:429|500|502|503|504)\b|"
+    r"500 Internal Server Error|EOF occurred in violation of protocol|"
+    r"too many requests|service unavailable|bad gateway|gateway timeout",
+    re.IGNORECASE,
+)
+PERMANENT_DOWNLOAD_ERROR = re.compile(
+    r"checksum|hash mismatch|signature verification|certificate verif|unauthorized|forbidden|"
+    r"permission denied|no solution found|dependency conflict|could not satisfy|no matching distribution",
+    re.IGNORECASE,
+)
 
 
 class SetupError(Exception):
@@ -89,30 +111,61 @@ def save_json(path, value):
     temporary.replace(path)
 
 
-def run(args, *, cwd=None, env=None, capture=False, timeout=1800):
+def transient_download_error(output):
+    return bool(TRANSIENT_DOWNLOAD_ERROR.search(output) and not PERMANENT_DOWNLOAD_ERROR.search(output))
+
+
+def download_backoff(command, attempt):
+    delay = 2**attempt
+    emit(f"{command}: transient download failure (attempt {attempt}/{DOWNLOAD_ATTEMPTS}); retrying in {delay}s.")
+    time.sleep(delay)
+
+
+def run(args, *, cwd=None, env=None, capture=False, timeout=1800, download=False, retry_cleanup=None):
     command_env = os.environ.copy()
     command_env.update(env or {})
-    try:
-        result = subprocess.run(
-            [str(arg) for arg in args],
-            cwd=cwd,
-            env=command_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SetupError(f"Could not execute {Path(args[0]).name}: {redact(exc)}") from None
-    if not capture:
-        emit(result.stdout.rstrip())
-    if result.returncode:
+    attempts = DOWNLOAD_ATTEMPTS if download else 1
+    command = Path(args[0]).name
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                [str(arg) for arg in args],
+                cwd=cwd,
+                env=command_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = exc.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode(errors="replace")
+            if not capture:
+                emit(partial.rstrip())
+            if attempt < attempts:
+                if retry_cleanup:
+                    retry_cleanup()
+                download_backoff(command, attempt)
+                continue
+            raise SetupError(f"Could not execute {command}: {redact(exc)}") from None
+        except OSError as exc:
+            raise SetupError(f"Could not execute {command}: {redact(exc)}") from None
+        if not capture:
+            emit(result.stdout.rstrip())
+        if not result.returncode:
+            return result.stdout.strip()
+        if attempt < attempts and transient_download_error(result.stdout):
+            if retry_cleanup:
+                retry_cleanup()
+            download_backoff(command, attempt)
+            continue
         raise SetupError(
-            f"{Path(args[0]).name} failed (exit {result.returncode}). "
+            f"{command} failed (exit {result.returncode}). "
             + (redact(result.stdout.strip()) if capture else "See sanitized output above.")
         )
-    return result.stdout.strip()
+    raise AssertionError("unreachable")
 
 
 def metadata():
@@ -226,21 +279,27 @@ def select_release(request, pypi, galaxy):
 
 
 def http_json(url):
+    cached = cache.metadata(url)
+    if cached is not None:
+        cache.record_metadata(url, cached)
+        return cached
     # No custom authentication storage. urllib honors standard proxy facilities.
-    for attempt in range(3):
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "avd-devcontainer-feature/1.0"})
             with urllib.request.urlopen(request, timeout=30) as response:
-                return json.load(response)
+                data = json.load(response)
+            cache.record_metadata(url, data)
+            return data
         except urllib.error.HTTPError as exc:
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == DOWNLOAD_ATTEMPTS:
                 raise SetupError(f"Metadata download failed: {redact(url)} (HTTP {exc.code}).") from None
-        except (urllib.error.URLError, TimeoutError):
-            if attempt == 2:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+            if attempt == DOWNLOAD_ATTEMPTS:
                 raise SetupError(f"Metadata download failed: {redact(url)}.") from None
         except (ValueError, TypeError):
             raise SetupError(f"Malformed JSON metadata: {redact(url)}.") from None
-        time.sleep(attempt + 1)
+        download_backoff("Metadata download", attempt)
     raise AssertionError("unreachable")
 
 
@@ -267,11 +326,16 @@ def resolve_release(request):
 
 def managed_env(config):
     cache_root = Path(config["user_home"]) / ".local/share/avd" if config["options"]["mode"] == "source" else PREFIX
+    uv_cache = cache.recording() / "uv" if cache.recording() else cache_root / "cache/uv"
+    cache.seed_uv(uv_cache)
     return {
-        "UV_CACHE_DIR": str(cache_root / "cache/uv"),
+        "UV_CACHE_DIR": str(uv_cache),
         "UV_PYTHON_INSTALL_DIR": str(PREFIX / "python"),
         "UV_PYTHON_DOWNLOADS": "never",
         "UV_PYTHON_PREFERENCE": "only-managed",
+        # The command wrapper owns the three attempts; avoid nested retry loops.
+        "UV_HTTP_RETRIES": "0",
+        "UV_HTTP_TIMEOUT": "60",
     }
 
 
@@ -282,12 +346,15 @@ def pip_install(config, requirements, *, source=None):
         # Allow the one intentional local editable build; keep every downloaded
         # dependency on published wheels, including build dependencies.
         args += ["--no-binary", "pyavd"]
+        # Prepared caches may contain an editable wheel for the same checkout
+        # path. Rebuild it so schema/template compilation runs in this checkout.
+        args += ["--reinstall-package", "pyavd"]
         args += ["--editable", f"{source / 'python-avd'}[ansible]", "--config-settings", "editable_mode=compat"]
         for group in ("dev", "doc", "coverage"):
             args += ["--group", f"{source / 'pyproject.toml'}:{group}"]
     if config["options"]["installSshSupport"]:
         args += ["paramiko", "ansible-pylibssh"]
-    run(args, env=managed_env(config))
+    run(args, env=managed_env(config), download=True, timeout=DOWNLOAD_TIMEOUT)
 
 
 def venv_probe(*args):
@@ -295,7 +362,8 @@ def venv_probe(*args):
 
 
 def install_collections(requirements, *, source=None):
-    destination = venv_probe("--paths")["site_packages"]
+    paths = venv_probe("--paths")
+    destination, controller = paths["site_packages"], paths["ansible"]
     # A command-local configuration prevents project config changing the install
     # destination or servers. No configuration is persisted into the project.
     with tempfile.TemporaryDirectory(prefix="avd-galaxy-") as directory:
@@ -307,19 +375,51 @@ def install_collections(requirements, *, source=None):
             json.dumps({"collections": [{"name": name, "version": version} for name, version in requirements.items()]})
         )
         if requirements:
+            env = {
+                "ANSIBLE_CONFIG": str(config),
+                "ANSIBLE_GALAXY_COLLECTIONS_PATH_WARNING": "false",
+                "ANSIBLE_GALAXY_SERVER_TIMEOUT": "60",
+            }
+            archives = cache.collections(requirements, controller)
+            record = cache.recording()
+            if record and archives is None:
+                output = directory / "archives"
+                run(
+                    [VENV / "bin/ansible-galaxy", "collection", "download", "-r", req, "-p", output],
+                    cwd=directory,
+                    env=env,
+                    download=True,
+                    timeout=DOWNLOAD_TIMEOUT,
+                    retry_cleanup=lambda: shutil.rmtree(output, ignore_errors=True),
+                )
+                target = record / "galaxy" / cache.collection_key(requirements, controller)
+                shutil.rmtree(target, ignore_errors=True)
+                shutil.copytree(output, target)
+                archives = sorted(target.glob("*.tar.gz"))
+                if not archives:
+                    raise SetupError("Galaxy download produced no collection archives.")
+                cache.write_json(
+                    target / "manifest.json",
+                    {
+                        "requirements": requirements,
+                        "ansible": controller,
+                        "epoch": cache.today(),
+                        "archives": [{"name": p.name, "sha256": cache.sha256(p)} for p in archives],
+                    },
+                )
             run(
                 [
                     VENV / "bin/ansible-galaxy",
                     "collection",
                     "install",
-                    "--force-with-deps",
-                    "-r",
-                    req,
+                    *(["--force", "--no-deps", *archives] if archives else ["--force-with-deps", "-r", req]),
                     "-p",
                     destination,
                 ],
                 cwd=directory,
-                env={"ANSIBLE_CONFIG": str(config), "ANSIBLE_GALAXY_COLLECTIONS_PATH_WARNING": "false"},
+                env=env,
+                download=True,
+                timeout=DOWNLOAD_TIMEOUT,
             )
     pth = Path(destination) / "avd-source.pth"
     if source:
@@ -401,13 +501,27 @@ def checkout(config):
     staging = tempfile.TemporaryDirectory(prefix=".source-", dir=source.parent) if fresh else contextlib.nullcontext()
     with staging as directory:
         worktree = Path(directory) / "source" if fresh else source
-        if fresh:
-            run(["git", "clone", "--no-checkout", "--", repository, worktree])
+        archive = cache.source(repository, ref) if fresh else None
+        if archive:
+            cache.extract(archive, worktree)
+            if git_details(worktree) != {"commit": ref, "dirty": False}:
+                raise SetupError("Cached source checkout does not match its pinned commit.")
+        elif fresh:
+            run(
+                ["git", "clone", "--no-checkout", "--", repository, worktree],
+                download=True,
+                timeout=DOWNLOAD_TIMEOUT,
+                # Only the disposable, unpublished clone may be removed.
+                retry_cleanup=lambda: shutil.rmtree(worktree, ignore_errors=True),
+            )
         if run(["git", "-C", worktree, "config", "--get", "remote.origin.url"], capture=True) != repository:
             raise SetupError(f"{source} has a different origin. Move it aside explicitly and rerun avd-setup-source.")
-        run(["git", "-C", worktree, "fetch", "--no-tags", "origin", ref])
-        target = run(["git", "-C", worktree, "rev-parse", "FETCH_HEAD^{commit}"], capture=True)
         current = None if fresh else run(["git", "-C", worktree, "rev-parse", "HEAD"], capture=True)
+        if archive or (re.fullmatch(r"[0-9a-f]{40}", ref) and current == ref):
+            target = ref
+        else:
+            run(["git", "-C", worktree, "fetch", "--no-tags", "origin", ref], download=True, timeout=DOWNLOAD_TIMEOUT)
+            target = run(["git", "-C", worktree, "rev-parse", "FETCH_HEAD^{commit}"], capture=True)
         if current != target:
             if not fresh and run(["git", "-C", worktree, "status", "--porcelain"], capture=True):
                 raise SetupError(

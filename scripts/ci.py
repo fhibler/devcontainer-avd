@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime
 import hashlib
 import importlib.util
 import json
@@ -25,6 +27,7 @@ ARTIFACTS = ROOT / "artifacts"
 ENGINE = os.environ.get("CONTAINER_ENGINE", "docker")
 MAX_SCENARIOS_PER_GROUP = 2
 PLATFORM_BUILD_TIMEOUT_SECONDS = 20 * 60
+LIFECYCLE_TIMEOUT_SECONDS = 30 * 60
 IMAGE_PULL_TIMEOUT_SECONDS = 3 * 60
 DOWNLOAD_ATTEMPTS = 3
 TRANSIENT_PULL_ERROR = re.compile(
@@ -86,6 +89,59 @@ def versions():
     )
 
 
+def download(*args, timeout=setup.DOWNLOAD_TIMEOUT, retry_cleanup=None):
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            return run(*args, timeout=timeout)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            if isinstance(exc, subprocess.CalledProcessError) and not setup.transient_download_error(exc.output or ""):
+                raise
+            if retry_cleanup:
+                retry_cleanup()
+            setup.download_backoff(Path(args[0]).name, attempt)
+    raise AssertionError("unreachable")
+
+
+def build_cache_key(provenance):
+    # Refresh unpinned transitive dependencies daily. Source files, Feature
+    # options, Python versions and base-image digests remain BuildKit inputs.
+    identity = {key: provenance[key] for key in ("avd", "baseline", "devel", "tools")}
+    identity["epoch"] = provenance.get("cache_epoch") or datetime.datetime.now(datetime.UTC).date().isoformat()
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:24]
+
+
+@contextlib.contextmanager
+def build_cache(name):
+    location = os.environ.get("AVD_BUILD_CACHE")
+    if not location:
+        yield []
+        return
+    root = Path(location)
+    slot = root / hashlib.sha256(name.encode()).hexdigest()[:24]
+    pending = slot.with_suffix(".next")
+    root.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(pending, ignore_errors=True)
+    args = []
+    if (slot / "index.json").is_file():
+        args += ["--cache-from", f"type=local,src={slot}"]
+        print(f"Restoring BuildKit cache for {name}", flush=True)
+    else:
+        print(f"No saved BuildKit cache for {name}; building normally", flush=True)
+    args += ["--cache-to", f"type=local,dest={pending},mode=min"]
+    try:
+        yield args
+        if not (pending / "index.json").is_file():
+            raise RuntimeError(f"BuildKit did not export the cache for {name}")
+        # Replace the previous export rather than accumulating orphaned blobs
+        # across runs. A failed build leaves the restored cache intact.
+        shutil.rmtree(slot, ignore_errors=True)
+        pending.rename(slot)
+    finally:
+        shutil.rmtree(pending, ignore_errors=True)
+
+
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(setup.sanitize(value), indent=2) + "\n")
@@ -97,6 +153,7 @@ def extract(archive, destination):
     assert (destination / "install.sh").is_file(), "Incomplete packaged Feature"
     for file in (
         "avd_setup.py",
+        "avd_cache.py",
         "bootstrap.env",
         "tooling-requirements.txt",
         "avd-command",
@@ -113,14 +170,59 @@ def group_scenarios(scenarios):
     for image, names in by_image.items():
         for offset in range(0, len(names), MAX_SCENARIOS_PER_GROUP):
             group_names = names[offset : offset + MAX_SCENARIOS_PER_GROUP]
+            selected = [row for row in scenarios if row["name"] in group_names]
+            minors = sorted({scenario_minor(row["options"]) for row in selected})
             groups.append(
                 {
                     "id": group_names[0],
                     "image": image,
                     "scenarios": json.dumps(group_names, separators=(",", ":")),
+                    "downloads": "py"
+                    + (minors[0] if len(minors) == 1 else "3.1[" + "".join(m[-1] for m in minors) + "]"),
+                    "sources": any(row.get("source") for row in selected),
                 }
             )
     return groups
+
+
+def scenario_minor(options):
+    defaults = {key: value["default"] for key, value in setup.metadata()["options"].items()}
+    return ".".join(setup.python_request({**defaults, **options}).split(".")[:2])
+
+
+def download_seed():
+    value = os.environ.get("AVD_CI_DOWNLOADS")
+    if not value:
+        return None
+    path = Path(value)
+    setup.cache.verify(path)
+    return path
+
+
+def seed_feature(configdir, config, seed):
+    feature = configdir / "avd-downloads"
+    feature.mkdir()
+    shutil.copytree(seed, feature / "inputs", symlinks=True)
+    write(
+        feature / "devcontainer-feature.json",
+        {
+            "id": "avd-downloads",
+            "version": "1.0.0",
+            "name": "CI download inputs",
+            # Buildah may rewrite /tmp permissions when committing Feature
+            # bind mounts. Use the standard alternative for installs and hooks.
+            "containerEnv": {"TMPDIR": "/var/tmp"},
+        },
+    )
+    installer = feature / "install.sh"
+    installer.write_text(
+        '#!/bin/sh\nset -eu\ncd "$(dirname "$0")"\n'
+        "mkdir -p /opt/avd/download-cache\ncp -a inputs/. /opt/avd/download-cache/\n"
+        "mkdir -p /var/tmp\nchmod 1777 /var/tmp\n"
+    )
+    installer.chmod(0o755)
+    config["features"] = {"./avd-downloads": {}, **config["features"]}
+    config["overrideFeatureInstallOrder"] = ["./avd-downloads"]
 
 
 def group_platform_images(images):
@@ -155,7 +257,7 @@ def prepare():
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     (ARTIFACTS / "SHA256SUMS").write_text(f"{digest}  {archive.name}\n")
     resolved = setup.resolve_release("latest")
-    devel = run("git", "ls-remote", "https://github.com/aristanetworks/avd.git", "refs/heads/devel").split()[0]
+    devel = download("git", "ls-remote", "https://github.com/aristanetworks/avd.git", "refs/heads/devel").split()[0]
     feature = json.loads((ROOT / "src/avd/devcontainer-feature.json").read_text())
     write(
         ARTIFACTS / "provenance.json",
@@ -168,6 +270,7 @@ def prepare():
             "archive_sha256": digest,
             "tools": versions(),
             "bootstrap": (ROOT / "src/avd/bootstrap.env").read_text(),
+            "cache_epoch": datetime.datetime.now(datetime.UTC).date().isoformat(),
         },
     )
     if os.environ.get("GITHUB_OUTPUT"):
@@ -177,6 +280,8 @@ def prepare():
             handle.write("platform_groups=" + json.dumps(group_platform_images(images), separators=(",", ":")) + "\n")
             handle.write("scenario_groups=" + json.dumps(group_scenarios(scenarios), separators=(",", ":")) + "\n")
             handle.write(f"version={feature['version']}\ncommit={run('git', 'rev-parse', 'HEAD')}\n")
+            handle.write(f"cache_key={build_cache_key(json.loads((ARTIFACTS / 'provenance.json').read_text()))}\n")
+            handle.write(f"source_key={versions()['SOURCE_BASELINE']}-{devel}\n")
     with tempfile.TemporaryDirectory() as directory:
         extract(archive, Path(directory))
 
@@ -214,7 +319,7 @@ def identity(image, log):
     return details["RepoDigests"][0]
 
 
-def offline_smoke(container, log):
+def offline_smoke(container, log, *, cached_downloads=False):
     run(ENGINE, "cp", ROOT / "test", f"{container}:/tmp/avd-test")
     config = json.loads(run(ENGINE, "exec", container, "cat", "/opt/avd/config.json"))
     uid = run(ENGINE, "exec", container, "id", "-u", config["user"])
@@ -252,6 +357,20 @@ def offline_smoke(container, log):
         samples.mkdir(exist_ok=True)
         for name in ("intended", "documentation"):
             run(ENGINE, "cp", f"{offline}:/tmp/avd-test/avd/inventory/{name}", samples / name)
+        if cached_downloads:
+            output = run(
+                ENGINE,
+                "run",
+                "--rm",
+                "--network=none",
+                "--entrypoint",
+                "/opt/avd/venv/bin/python",
+                snapshot,
+                "/tmp/avd-test/support/cache_reinstall.py",
+                timeout=PLATFORM_BUILD_TIMEOUT_SECONDS,
+                log=log / "cache-reinstall.log",
+            )
+            print(output.splitlines()[-1], flush=True)
     finally:
         subprocess.run([ENGINE, "rm", "-f", offline], check=False)
         run(ENGINE, "rmi", snapshot)
@@ -268,28 +387,45 @@ def platform_smoke(image):
         payload = directory / "feature"
         extract(ARTIFACTS / "devcontainer-feature-avd.tgz", payload)
         dockerfile = directory / "Dockerfile"
+        seed = download_seed()
+        seed_copy = ""
+        if seed:
+            shutil.copytree(seed, directory / "downloads", symlinks=True)
+            seed_copy = "COPY downloads /opt/avd/download-cache\n"
         dockerfile.write_text(
-            f"FROM {image_id}\nCOPY feature /tmp/feature\nRUN VERSION={provenance['avd']} bash /tmp/feature/install.sh\nENV PATH=/opt/avd/venv/bin:$PATH\n"
+            f"FROM {image_id}\nCOPY feature /tmp/feature\n{seed_copy}ARG AVD_CI_DEPENDENCIES\n"
+            f'RUN test -n "$AVD_CI_DEPENDENCIES" && VERSION={provenance["avd"]} bash /tmp/feature/install.sh\n'
+            "ENV PATH=/opt/avd/venv/bin:$PATH\n"
         )
         tag = "avd-platform-" + uuid.uuid4().hex
         container = "avd-platform-" + uuid.uuid4().hex
         try:
-            output = run(
-                ENGINE,
-                "build",
-                "-t",
-                tag,
-                "-f",
-                dockerfile,
-                directory,
-                timeout=PLATFORM_BUILD_TIMEOUT_SECONDS,
-                log=log / "build.log",
-            )
+            with build_cache(image_id) as cache_args:
+                # Preserve local Docker/Podman builds when persistent caching is
+                # disabled; CI uses the Buildx builder selected by the workflow.
+                command = [ENGINE, "buildx", "build", "--load"] if cache_args else [ENGINE, "build"]
+                output = run(
+                    *command,
+                    *cache_args,
+                    "--build-arg",
+                    f"AVD_CI_DEPENDENCIES={build_cache_key(provenance)}",
+                    "-t",
+                    tag,
+                    "-f",
+                    dockerfile,
+                    directory,
+                    timeout=PLATFORM_BUILD_TIMEOUT_SECONDS,
+                    log=log / "build.log",
+                )
             print(setup.redact(output), flush=True)
             run(ENGINE, "create", "--name", container, tag, "sleep", "infinity")
             run(ENGINE, "start", container)
             (log / "manifest.json").write_text(run(ENGINE, "exec", container, "avd-info", "--json"))
-            offline_smoke(container, log)
+            offline_smoke(
+                container,
+                log,
+                cached_downloads=bool(seed) and image == "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+            )
             # A separate disposable snapshot owns bootstrap failure cases.
             if image == "ubuntu:26.10":
                 run(
@@ -349,7 +485,7 @@ def lifecycle_config(scenario, provenance):
             "postCreateCommand": [
                 "/opt/avd/venv/bin/python",
                 "-c",
-                'import pyavd; from pathlib import Path; assert Path("/opt/avd/venv/bin/ansible-playbook").exists(); Path("/tmp/consumer-hook").write_text("complete")',
+                'import pyavd; from pathlib import Path; assert Path("/opt/avd/venv/bin/ansible-playbook").exists(); Path("/var/tmp/consumer-hook").write_text("complete")',
             ],
             "waitFor": "postCreateCommand",
             "customizations": {"vscode": {"settings": {"files.trimTrailingWhitespace": True}}},
@@ -367,19 +503,37 @@ def lifecycle(scenario):
     log = ARTIFACTS / scenario["name"]
     log.mkdir(parents=True, exist_ok=True)
     provenance = json.loads((ARTIFACTS / "provenance.json").read_text())
-    identity(scenario["image"], log)
+    image_id = identity(scenario["image"], log)
     # Directory permissions/UID exercise bind mounts independently from build UID.
     workspace = Path(tempfile.mkdtemp(prefix="avd-lifecycle-"))
     container = None
     try:
         source = scenario.get("source")
+        seed = download_seed()
         if source and scenario["options"].get("sourceType", "workspace") == "workspace":
-            run("git", "clone", "--filter=blob:none", "https://github.com/aristanetworks/avd.git", workspace)
-            run("git", "-C", workspace, "checkout", "--detach", provenance[source])
+            repository = "https://github.com/aristanetworks/avd.git"
+            archive = setup.cache.source(repository, provenance[source], directory=seed) if seed else None
+            if archive:
+                setup.cache.extract(archive, workspace)
+                assert setup.git_details(workspace) == {"commit": provenance[source], "dirty": False}
+                assert run("git", "-C", workspace, "remote", "get-url", "origin") == repository
+            else:
+                download(
+                    "git",
+                    "clone",
+                    "--filter=blob:none",
+                    repository,
+                    workspace,
+                    retry_cleanup=lambda: shutil.rmtree(workspace, ignore_errors=True),
+                )
+                run("git", "-C", workspace, "checkout", "--detach", provenance[source])
         configdir = workspace / ".devcontainer"
         configdir.mkdir(exist_ok=True)
         extract(ARTIFACTS / "devcontainer-feature-avd.tgz", configdir / "avd")
         config = lifecycle_config(scenario, provenance)
+        if seed:
+            seed_feature(configdir, config, seed)
+        config["image"] = image_id
         os.environ.update(config["containerEnv"])
         if scenario.get("uidAdjustment"):
             original_uid = int(run(ENGINE, "run", "--rm", scenario["image"], "id", "-u", scenario["user"]))
@@ -387,13 +541,24 @@ def lifecycle(scenario):
         (configdir / "devcontainer.json").write_text(json.dumps(config, indent=2) + "\n")
         # Real up is essential: invoking the source helper manually cannot prove
         # hook execution, workspace context, UID handling, or consumer ordering.
-        output = run(
-            "devcontainer", "up", "--docker-path", ENGINE, "--workspace-folder", workspace, "--log-level", "info"
-        )
+        with build_cache(scenario["name"]) as cache_args:
+            output = run(
+                "devcontainer",
+                "up",
+                "--docker-path",
+                ENGINE,
+                "--workspace-folder",
+                workspace,
+                "--log-level",
+                "info",
+                *cache_args,
+                timeout=LIFECYCLE_TIMEOUT_SECONDS,
+                log=log / "up.log",
+            )
         (log / "up.log").write_text(setup.redact(output))
         result = json.loads(output.splitlines()[-1])
         container = result["containerId"]
-        assert exec_container(workspace, "cat", "/tmp/consumer-hook") == "complete"
+        assert exec_container(workspace, "cat", "/var/tmp/consumer-hook") == "complete"
         merged_output = run(
             "devcontainer",
             "read-configuration",
@@ -439,7 +604,7 @@ def lifecycle(scenario):
             run(ENGINE, "stop", container)
             run(ENGINE, "start", container)
             assert exec_container(workspace, "sha256sum", state_file) == before_restart
-            assert exec_container(workspace, "cat", "/tmp/consumer-hook") == "complete"
+            assert exec_container(workspace, "cat", "/var/tmp/consumer-hook") == "complete"
         if scenario.get("reinstall"):
             run(ENGINE, "cp", configdir / "avd", f"{container}:/tmp/reinstall-feature")
             install_env = [
@@ -482,7 +647,7 @@ def lifecycle(scenario):
             orphan = run(ENGINE, "ps", "-aq", "--filter", f"label=devcontainer.local_folder={workspace}")
             if orphan:
                 run(ENGINE, "rm", "-f", *orphan.splitlines())
-        shutil.rmtree(workspace)
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def lifecycle_group(names):

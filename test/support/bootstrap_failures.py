@@ -15,7 +15,7 @@ def main():
         shutil.copytree("/tmp/feature", payload)
         bin_dir = directory / "bin"
         bin_dir.mkdir()
-        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", AVD_DOWNLOAD_CACHE="")
         options = json.loads(Path("/opt/avd/config.json").read_text())["options"]
         env.update(
             {name.upper(): str(value).lower() if isinstance(value, bool) else value for name, value in options.items()}
